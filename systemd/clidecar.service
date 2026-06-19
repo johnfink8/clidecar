@@ -1,0 +1,31 @@
+[Unit]
+Description=Claude self-recycling sidecar
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+OnFailure=clidecar-fallback.service
+
+[Service]
+Type=simple
+ExecStart=%h/clidecar/bin/sidecar.sh
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+# KillMode=process: on stop/restart, signal ONLY the sidecar — leave the managed
+# Claude (separate screen session) running so `reload` adopts it untouched.
+KillMode=process
+Environment=HOME=%h
+Environment=TERM=screen-256color
+# bun installs to ~/.bun/bin via a line in ~/.bashrc that is skipped for
+# non-interactive shells (our `bash -lc` launch). The discord channel plugin
+# shells out to `bun`, so put it on PATH here explicitly — don't rely on rc files.
+Environment=BUN_INSTALL=%h/.bun
+Environment=PATH=%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+# The discord channel plugin runs `bun install && bun server.ts` on launch, so
+# the MCP server is slow to come up on a cold boot. Give claude's MCP handshake
+# room so it connects on the first attempt instead of marking it failed.
+Environment=MCP_TIMEOUT=60000
+
+[Install]
+WantedBy=default.target

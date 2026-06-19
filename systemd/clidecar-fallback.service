@@ -1,0 +1,8 @@
+[Unit]
+Description=Claude sidecar fallback (restore known-good sidecar)
+
+[Service]
+Type=oneshot
+ExecStart=%h/clidecar/bin/fallback.sh
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/bin:/bin

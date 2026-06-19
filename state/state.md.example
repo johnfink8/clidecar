@@ -1,0 +1,11 @@
+# Live state — the "now"
+
+> Churns every recycle. What the managed Claude was mid-doing and anything the
+> next fresh instance needs to pick up immediately. Durable history goes to your
+> memory store; always-on rules go to ~/.claude/CLAUDE.md. Keep this SHORT.
+
+## Current focus
+_(nothing yet — copy this file to state.md and fill in)_
+
+## Next on resume
+_(what the fresh instance should do first)_

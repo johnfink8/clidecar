@@ -1,0 +1,9 @@
+# All runtime/personal data lives in ~/.clidecar, OUTSIDE this repo, so there is
+# normally nothing here to ignore. These are defensive guards only — against an
+# accidental copy of a personal/runtime file into the repo tree, or leftovers
+# from the old in-repo layout.
+config.env
+control/
+known-good/
+state/state.md
+state/queue.md

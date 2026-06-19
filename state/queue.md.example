@@ -1,0 +1,16 @@
+# Task queue
+
+> The running backlog the managed Claude works from. Edit this to redirect it;
+> a fresh instance reads it on launch. Keep entries small and actionable. Done
+> items move to the bottom or get deleted.
+
+## Now
+- [ ] _(first task)_
+
+## Next
+- [ ]
+
+## Someday
+- [ ]
+
+## Done

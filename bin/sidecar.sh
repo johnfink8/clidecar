@@ -39,7 +39,16 @@ load_config() {
 }
 
 claude_pid()   { cat "$PIDFILE" 2>/dev/null; }
-claude_alive() { local p; p="$(claude_pid)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+claude_alive() {
+  local p; p="$(claude_pid)"
+  [ -n "$p" ] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  # PID-reuse guard: after a reboot the recorded PID may now belong to an
+  # unrelated process. Only treat it as our claude if the live process's cmdline
+  # actually contains "claude" — else we'd falsely "adopt" a stranger and never
+  # launch a fresh claude (a silent false-healthy). grep -a: cmdline is NUL-sep.
+  grep -qa claude "/proc/$p/cmdline" 2>/dev/null
+}
 
 launch_claude() {
   load_config
@@ -50,7 +59,11 @@ launch_claude() {
   # STARTUP_PROMPT (if set) is appended as claude's positional prompt and expanded
   # by the INNER shell from the (exported) environment, so its text never needs
   # shell-escaping here; an empty value is simply omitted (no blank prompt).
-  local inner="cd '$WORKDIR' && echo \$\$ > '$PIDFILE' && exec $CLAUDE_BIN $CLAUDE_ARGS"
+  # WORKDIR/PIDFILE/CLAUDE_BIN are %q-quoted so a path with a space or quote can't
+  # break out of the inner command line; CLAUDE_ARGS stays unquoted on purpose so
+  # it word-splits into separate flags. \$\$ stays literal for the inner shell.
+  local inner
+  inner="cd $(printf %q "$WORKDIR") && echo \$\$ > $(printf %q "$PIDFILE") && exec $(printf %q "$CLAUDE_BIN") $CLAUDE_ARGS"
   if [ -n "${STARTUP_PROMPT:-}" ]; then
     inner="$inner \"\$STARTUP_PROMPT\""
   fi

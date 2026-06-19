@@ -29,10 +29,32 @@ case "$cmd" in
     ;;
   set)
     key="${1:?usage: clidecar set KEY VALUE}"; val="${2:?usage: clidecar set KEY VALUE}"
-    if grep -qE "^${key}=" "$CONFIG_FILE"; then
-      sed -i -E "s|^${key}=.*|${key}=\"${val}\"|" "$CONFIG_FILE"
-    else
-      printf '%s="%s"\n' "$key" "$val" >> "$CONFIG_FILE"
+    # Keys must be shell identifiers — config.env is sourced, so a non-identifier
+    # key could never be read back. Fail loud rather than write a line that breaks
+    # sourcing later. (Also keeps the grep below regex-metachar-free.)
+    if ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "clidecar set: invalid key '$key' (must be a shell identifier)" >&2; exit 1
+    fi
+    # Escape for a double-quoted shell value: backslash and double-quote only, so
+    # the value round-trips literally while $HOME-style expansion still works
+    # (config.env's contract — see config.env.example). Written with printf into a
+    # rewritten file, never sed, so | & " and newlines can't corrupt config.env
+    # the way the old sed `|`-delimiter substitution did.
+    esc="${val//\\/\\\\}"; esc="${esc//\"/\\\"}"
+    tmp="$(mktemp "${CONFIG_FILE}.XXXXXX")" || { echo "clidecar set: mktemp failed" >&2; exit 1; }
+    # Each write is checked before the atomic mv — a failed/partial rewrite must
+    # NOT clobber the good config or report success (no set -e here, so rc must be
+    # inspected explicitly). grep rc=1 means "no lines survived" (re-setting the
+    # only key) — normal; rc>=2 is a real read error, so bail on that alone.
+    if [ -f "$CONFIG_FILE" ]; then
+      grep -vE "^${key}=" "$CONFIG_FILE" > "$tmp"
+      [ "$?" -ge 2 ] && { echo "clidecar set: failed reading $CONFIG_FILE" >&2; rm -f "$tmp"; exit 1; }
+    fi
+    if ! printf '%s="%s"\n' "$key" "$esc" >> "$tmp"; then
+      echo "clidecar set: failed writing temp file" >&2; rm -f "$tmp"; exit 1
+    fi
+    if ! mv "$tmp" "$CONFIG_FILE"; then
+      echo "clidecar set: failed updating $CONFIG_FILE" >&2; rm -f "$tmp"; exit 1
     fi
     echo "set ${key}=\"${val}\". Run 'clidecar recycle' to apply."
     ;;

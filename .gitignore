@@ -7,3 +7,7 @@ control/
 known-good/
 state/state.md
 state/queue.md
+
+# Python bytecode from the hook scripts.
+__pycache__/
+*.pyc

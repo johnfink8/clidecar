@@ -62,6 +62,18 @@ def turn_lines(turn):
     return items
 
 
+def work_lines(turn):
+    """turn_lines minus the closing answer — the trailing narration that follows the
+    last tool. The live status block never shows it (it's flushed only after the final
+    tool's PostToolUse) and the Stop hook posts it as its own message, so including it
+    when freezing the block would duplicate the closing. A no-tool turn trims to empty,
+    which is correct: such turns open no status block at all."""
+    items = turn_lines(turn)
+    while items and items[-1][0] == "text":
+        items.pop()
+    return items
+
+
 def render(items, footer=None):
     """Newest-first fit of items into one Discord message: narrations whole, tool
     summaries one-line-capped. Oldest WHOLE items roll off only if the block would

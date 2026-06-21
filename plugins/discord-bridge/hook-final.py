@@ -58,7 +58,7 @@ def fail(sid, message, **log):
 
 def mark_done(state, turn):
     if state.get("message_id"):
-        lines = h.turn_lines(turn)[state.get("base", 0):]
+        lines = h.work_lines(turn)[state.get("base", 0):]
         h.discord_edit(state["message_id"], h.render(lines, footer=f"{h.DONE} *done*"))
     src = state.get("source_message_id")
     if src:

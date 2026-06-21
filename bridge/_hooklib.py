@@ -13,7 +13,6 @@ import datetime
 import fcntl
 import json
 import os
-import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Generator
@@ -22,6 +21,7 @@ BIN = os.path.dirname(os.path.abspath(__file__))
 if BIN not in sys.path:
     sys.path.insert(0, BIN)
 import channel
+import exchange as ex
 import transcript as t
 
 STATE_DIR = os.path.expanduser("~/.clidecar/state")
@@ -457,42 +457,36 @@ def turn_lock(session_id: str | None) -> Generator[None, None, None]:
             fh.close()
 
 
-def _transport(*args: str) -> tuple[int, str]:
-    """Run the active channel's transport script; (returncode, stdout). The single shell-out
-    point for all channel I/O. Returns (1, "") if no channel resolves — but logs that loudly
-    first (events.jsonl + stderr) so a misconfigured bridge is diagnosable, not a silent
-    no-op indistinguishable from a transient send failure."""
-    script, reason = channel.transport()
-    if not script:
-        log_event("channel_unresolved", {"reason": reason, "verb": args[0] if args else None})
-        sys.stderr.write(f"clidecar bridge: no messaging channel resolved — {reason}\n")
-        return 1, ""
-    out = subprocess.run([script, *args], capture_output=True, text=True)
-    if out.returncode != 0:
-        sys.stderr.write(out.stderr)
-    return out.returncode, out.stdout
-
-
 def channel_send(text: str, reply_to: str | None = None) -> str | None:
-    args = ["send", text] + ([reply_to] if reply_to else [])
-    code, stdout = _transport(*args)
-    return stdout.strip() or None if code == 0 else None
+    """Send one message through the gateway broker and return its new id. STRICT LANES: the hook
+    never touches the adapter — if the gateway is unreachable, fail LOUD (log + stderr) and return
+    None so the caller persists/pings, NEVER a reach-around to the transport."""
+    mid = ex.emit(ex.Outbound(text=text, kind="message", source="claude", reply_to=reply_to))
+    if mid is None:
+        log_event("gateway_send_failed", {"chars": len(text)})
+        sys.stderr.write("clidecar bridge: gateway unreachable on send (strict lanes — no adapter fallback)\n")
+    return mid
 
 
 def channel_edit(message_id: str, text: str) -> bool:
-    return _transport("edit", message_id, text)[0] == 0
+    ok = ex.edit(message_id, text)
+    if not ok:
+        log_event("gateway_edit_failed", {"message_id": message_id})
+    return ok
 
 
 def channel_react(message_id: str, emoji: str, add: bool = True) -> bool:
-    return _transport("react" if add else "unreact", message_id, emoji)[0] == 0
+    ok = ex.react(message_id, emoji, add)
+    if not ok:
+        log_event("gateway_react_failed", {"message_id": message_id, "emoji": emoji})
+    return ok
 
 
 def channel_latest() -> str | None:
-    """The channel's most recent message id, or None. Lets the progress hook tell when
-    a new message (John's) has landed below its status message so it can re-home a fresh
-    one rather than keep editing a message that has scrolled out of view."""
-    code, stdout = _transport("latest")
-    return stdout.strip() or None if code == 0 else None
+    """The channel's most recent message id, or None. Lets the progress hook tell when a new
+    message (John's) has landed below its status message so it can re-home a fresh one rather than
+    keep editing a message that has scrolled out of view."""
+    return ex.latest()
 
 
 def can(capability: str) -> bool:

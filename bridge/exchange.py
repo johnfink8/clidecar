@@ -32,9 +32,11 @@ from typing import Callable
 import transcript as t
 
 SOCK_PATH = os.path.expanduser("~/.clidecar/control/gateway.sock")
+OP_RETRIES = 2       # the gateway retries a transient adapter failure so hooks never see a flaky transport
+OP_BACKOFF_S = 0.5
 
 Clock = Callable[[], float]
-Send = Callable[[str, str | None], str | None]   # (text, reply_to) -> sent message id, or None
+Transport = Callable[..., tuple[int, str]]       # the adapter shell-out: (verb, *args) -> (returncode, stdout)
 Deliver = Callable[["Inbound"], None]            # hand a message to Claude as a <channel> prompt
 
 
@@ -114,25 +116,51 @@ class Broker:
     serve() once (spawns the accept + reap threads), and calls route_inbound() for every message it
     receives from the transport."""
 
-    def __init__(self, send: Send, deliver: Deliver, clock: Clock = time.time) -> None:
-        self._send = send
+    def __init__(self, transport: Transport, deliver: Deliver, clock: Clock = time.time) -> None:
+        self._transport = transport          # the ONLY caller of the adapter — strict lanes
         self._deliver = deliver
         self._clock = clock
-        self._claims: list[_Claim] = []          # open waits, newest-first (a stack)
+        self._claims: list[_Claim] = []       # open waits, newest-first (a stack)
         self._emitted: set[tuple[str, str]] = set()
         self._lock = threading.Lock()
 
+    def _op(self, *args: str) -> tuple[int, str]:
+        """Call the adapter, retrying a transient failure — the gateway is the ONE place transport
+        retry/error-handling lives, so hooks never see (or work around) a flaky transport."""
+        code, out = self._transport(*args)
+        for _ in range(OP_RETRIES):
+            if code == 0:
+                break
+            time.sleep(OP_BACKOFF_S)
+            code, out = self._transport(*args)
+        return code, out
+
     def emit(self, out: Outbound) -> bool:
-        """Emit ONE outbound message to the transport, exactly once. Dedup on (kind, dedup_key); a
-        repeat returns False. The single outbound funnel for every producer."""
-        if out.dedup_key is not None:
-            key = (out.kind, out.dedup_key)
+        """Emit ONE outbound message to the transport, exactly once. Dedup on (kind, dedup_key). The
+        key is CLAIMED before the send and RELEASED on failure (claim/commit/release) — so a concurrent
+        duplicate can't race in, yet a failed send doesn't permanently suppress a retry of the same
+        logical message. The single outbound funnel for every producer."""
+        key = (out.kind, out.dedup_key) if out.dedup_key is not None else None
+        if key is not None:
             with self._lock:
                 if key in self._emitted:
                     return False
                 self._emitted.add(key)
-        self._send(out.text, out.reply_to)
-        return True
+        code, _ = self._op("send", out.text, *([out.reply_to] if out.reply_to else []))
+        if code != 0 and key is not None:
+            with self._lock:
+                self._emitted.discard(key)  # release so a retry can re-emit — never silently drop
+        return code == 0
+
+    def edit(self, message_id: str, text: str) -> bool:
+        return self._op("edit", message_id, text)[0] == 0
+
+    def react(self, message_id: str, emoji: str, add: bool = True) -> bool:
+        return self._op("react" if add else "unreact", message_id, emoji)[0] == 0
+
+    def latest(self) -> str | None:
+        code, out = self._op("latest")
+        return out.strip() or None if code == 0 else None
 
     def route_inbound(self, msg: Inbound) -> str:
         """Route ONE inbound message to exactly one sink. Returns "exchange:<label>" if an open claim
@@ -194,6 +222,18 @@ class Broker:
             ))
             _send_line(conn, {"sent": sent})
             conn.close()
+        elif op == "edit":
+            ok = self.edit(str(req.get("message_id", "")), str(req.get("text", "")))
+            _send_line(conn, {"ok": ok})
+            conn.close()
+        elif op == "react":
+            ok = self.react(str(req.get("message_id", "")), str(req.get("emoji", "")),
+                            bool(req.get("add", True)))
+            _send_line(conn, {"ok": ok})
+            conn.close()
+        elif op == "latest":
+            _send_line(conn, {"id": self.latest()})
+            conn.close()
         else:
             conn.close()
 
@@ -238,20 +278,42 @@ def ask(chat_id: str, prompt: str | None, *, since_id: str, timeout: float, labe
     return Inbound.from_obj(resp.get("reply"))  # absent ("lapsed") → from_obj(None) → None
 
 
-def emit(out: Outbound, *, sock_path: str = SOCK_PATH) -> bool:
-    """Ask the gateway to emit one outbound message, deduped — for gateway-side producers that aren't
-    the gateway process itself (a hook dumping file contents). Returns True if sent, False if deduped
-    or the gateway is unreachable."""
+def _request(payload: dict[str, object], sock_path: str, timeout: float = 10) -> dict[str, object] | None:
+    """One request→response round-trip to the gateway socket; None if the gateway is unreachable
+    (the caller fails loud — never reaches around to the adapter)."""
     try:
         conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conn.settimeout(10)
+        conn.settimeout(timeout)
         conn.connect(sock_path)
-        _send_line(conn, {"op": "emit", **{k: v for k, v in asdict(out).items()}})
+        _send_line(conn, payload)
         resp = _recv_line(conn)
         conn.close()
+        return resp
     except OSError:
-        return False
+        return None
+
+
+def emit(out: Outbound, *, sock_path: str = SOCK_PATH) -> bool:
+    """Ask the gateway to emit one outbound message, deduped. True if sent, False if deduped or the
+    gateway is unreachable. Every hook send goes through here — the adapter is the gateway's alone."""
+    resp = _request({"op": "emit", **asdict(out)}, sock_path)
     return bool(resp is not None and resp.get("sent"))
+
+
+def edit(message_id: str, text: str, *, sock_path: str = SOCK_PATH) -> bool:
+    resp = _request({"op": "edit", "message_id": message_id, "text": text}, sock_path)
+    return bool(resp is not None and resp.get("ok"))
+
+
+def react(message_id: str, emoji: str, add: bool = True, *, sock_path: str = SOCK_PATH) -> bool:
+    resp = _request({"op": "react", "message_id": message_id, "emoji": emoji, "add": add}, sock_path)
+    return bool(resp is not None and resp.get("ok"))
+
+
+def latest(*, sock_path: str = SOCK_PATH) -> str | None:
+    resp = _request({"op": "latest"}, sock_path)
+    v = resp.get("id") if resp is not None else None
+    return v if isinstance(v, str) else None
 
 
 def _num(req: dict[str, object] | None, key: str, default: float) -> float:

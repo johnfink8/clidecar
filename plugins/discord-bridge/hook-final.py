@@ -49,7 +49,7 @@ def await_closing(transcript):
 def fail(sid, message, **log):
     """Surface a bridge failure loudly and stop — never mark the turn done."""
     h.log_event("Stop", {"outcome": "fail", "detail": message, **log})
-    if not h.discord_send(f"⚠️ bridge: {message}"):
+    if not h.channel_send(f"⚠️ bridge: {message}"):
         # The warning ping itself couldn't land (Discord down). Leave a file trace so the
         # failure isn't invisible to the one person who could fix it.
         h.persist_undelivered(sid, f"⚠️ bridge failure (Discord unreachable): {message}")
@@ -60,7 +60,7 @@ def deliver(sid, text):
     """Post the closing answer (chunked) to Discord; True on success. On refusal, log +
     persist + ⚠️ ping and return False so the caller bails — the answer is never lost
     silently."""
-    sent_ids = [h.discord_send(part) for part in chunks(text)]
+    sent_ids = [h.channel_send(part) for part in chunks(text)]
     if any(mid is None for mid in sent_ids):
         # Record the answer to the OSError-guarded log FIRST, so a durable trace exists
         # even if the file persist below also fails.
@@ -82,14 +82,14 @@ def finalize(state, turn, require=False):
     mid = state.get("message_id")
     if mid:
         lines = h.turn_lines(turn)[state.get("base", 0):]
-        if not h.discord_edit(mid, h.render(lines, footer=f"{h.DONE} *done*")) and require:
+        if not h.channel_edit(mid, h.render(lines, footer=f"{h.DONE} *done*")) and require:
             return False
     elif require:
         return False
     src = state.get("source_message_id")
-    if src:
-        h.discord_react(src, h.DONE)             # add ✅ first so the reaction row never empties
-        h.discord_react(src, h.SEEN, add=False)  # then drop 👀 — avoids a vertical-size flicker
+    if src and h.can("react"):
+        h.channel_react(src, h.DONE)             # add ✅ first so the reaction row never empties
+        h.channel_react(src, h.SEEN, add=False)  # then drop 👀 — avoids a vertical-size flicker
     return True
 
 

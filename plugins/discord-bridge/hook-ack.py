@@ -30,7 +30,11 @@ def main():
     if not mid:
         h.log_event("UserPromptSubmit", {"outcome": "no_source_message"})
         return
-    ok = h.discord_react(mid, h.SEEN)
+    if not h.can("react"):
+        # Channel can't react (e.g. Telegram); the status message itself is the visible ack.
+        h.log_event("UserPromptSubmit", {"outcome": "no_react_capability", "source": mid})
+        return
+    ok = h.channel_react(mid, h.SEEN)
     h.log_event("UserPromptSubmit", {"outcome": "react" if ok else "react_failed", "source": mid})
 
 

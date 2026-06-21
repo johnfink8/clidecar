@@ -41,8 +41,8 @@ def main():
         shown = state.get("shown", 0)
         mid = state.get("message_id")
 
-        if mid and not is_md:
-            latest = h.discord_latest()  # re-home on tool boundaries, not per narration segment
+        if mid and not is_md and h.can("latest"):
+            latest = h.channel_latest()  # re-home on tool boundaries, not per narration segment
             if latest and latest != mid:
                 base, mid = shown, None  # freeze the old message; the new one starts here
 
@@ -56,9 +56,9 @@ def main():
         if mid:
             if body == state.get("last_body"):
                 return  # unchanged — MessageDisplay can fire repeatedly mid-block; skip the redundant edit
-            h.discord_edit(mid, body)
+            h.channel_edit(mid, body)
         else:
-            mid = h.discord_send(body)
+            mid = h.channel_send(body)
             if not mid:
                 return
         state.update(base=base, shown=len(full), last_body=body, message_id=mid)

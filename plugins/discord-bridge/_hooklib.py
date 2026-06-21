@@ -15,12 +15,12 @@ import sys
 BIN = os.path.dirname(os.path.abspath(__file__))
 if BIN not in sys.path:
     sys.path.insert(0, BIN)
+import channel
 import transcript as t
 
 STATE_DIR = os.path.expanduser("~/.clidecar/state")
 LOG_DIR = os.path.join(STATE_DIR, "hooklog")
 UNDELIVERED_DIR = os.path.join(STATE_DIR, "undelivered")
-DISCORD_MSG = os.path.join(BIN, "discord-msg.sh")
 
 SEEN = "👀"
 DONE = "✅"
@@ -227,44 +227,41 @@ def turn_lock(session_id):
             fh.close()
 
 
-def discord_send(text, reply_to=None):
-    args = [DISCORD_MSG, "send", text]
-    if reply_to:
-        args.append(reply_to)
-    out = subprocess.run(args, capture_output=True, text=True)
+def _transport(*args):
+    """Run the active channel's transport script; (returncode, stdout) or (1, "") if no
+    channel is configured. The single shell-out point for all channel I/O."""
+    script = channel.transport()
+    if not script:
+        return 1, ""
+    out = subprocess.run([script, *args], capture_output=True, text=True)
     if out.returncode != 0:
         sys.stderr.write(out.stderr)
-        return None
-    return out.stdout.strip() or None
+    return out.returncode, out.stdout
 
 
-def discord_edit(message_id, text):
-    out = subprocess.run(
-        [DISCORD_MSG, "edit", message_id, text], capture_output=True, text=True
-    )
-    if out.returncode != 0:
-        sys.stderr.write(out.stderr)
-        return False
-    return True
+def channel_send(text, reply_to=None):
+    args = ["send", text] + ([reply_to] if reply_to else [])
+    code, stdout = _transport(*args)
+    return stdout.strip() or None if code == 0 else None
 
 
-def discord_react(message_id, emoji, add=True):
-    out = subprocess.run(
-        [DISCORD_MSG, "react" if add else "unreact", message_id, emoji],
-        capture_output=True, text=True,
-    )
-    if out.returncode != 0:
-        sys.stderr.write(out.stderr)
-        return False
-    return True
+def channel_edit(message_id, text):
+    return _transport("edit", message_id, text)[0] == 0
 
 
-def discord_latest():
+def channel_react(message_id, emoji, add=True):
+    return _transport("react" if add else "unreact", message_id, emoji)[0] == 0
+
+
+def channel_latest():
     """The channel's most recent message id, or None. Lets the progress hook tell when
     a new message (John's) has landed below its status message so it can re-home a fresh
     one rather than keep editing a message that has scrolled out of view."""
-    out = subprocess.run([DISCORD_MSG, "latest"], capture_output=True, text=True)
-    if out.returncode != 0:
-        sys.stderr.write(out.stderr)
-        return None
-    return out.stdout.strip() or None
+    code, stdout = _transport("latest")
+    return stdout.strip() or None if code == 0 else None
+
+
+def can(capability):
+    """Whether the active channel declares a capability (edit/react/latest), so the core
+    can degrade — e.g. skip the 👀 react or the re-home check on a channel that lacks them."""
+    return bool(channel.capabilities().get(capability))

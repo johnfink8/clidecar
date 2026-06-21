@@ -73,20 +73,19 @@ def deliver(sid, text):
     return True
 
 
-def finalize(state, turn, answer=None):
-    """Freeze the status message and swap the 👀 ack to ✅. With `answer` (a pure-output
-    turn) the status block IS the whole answer, so render it in place rather than wiping it
-    to an empty work block and reposting. Returns False only when an in-place answer
-    couldn't be edited in (status message gone) so the caller delivers it normally and never
-    drops it; a work-turn freeze is cosmetic, so its edit failing is non-fatal (the closing
-    was already posted separately)."""
+def finalize(state, turn, require=False):
+    """Decorate the status block done: render the SAME turn_lines the live block already
+    showed — never a subset, so the closing the user is reading is never removed — and swap
+    only the trailing footer ⏳→✅ (plus the 👀→✅ react). `require` means the answer lives
+    ONLY in this block (no separate post), so a failed or absent edit returns False and the
+    caller posts it instead — the answer is never dropped."""
     mid = state.get("message_id")
-    if answer is not None:
-        if not mid or not h.discord_edit(mid, h.render([("text", answer)], footer=f"{h.DONE} *done*")):
+    if mid:
+        lines = h.turn_lines(turn)[state.get("base", 0):]
+        if not h.discord_edit(mid, h.render(lines, footer=f"{h.DONE} *done*")) and require:
             return False
-    elif mid:
-        lines = h.work_lines(turn)[state.get("base", 0):]
-        h.discord_edit(mid, h.render(lines, footer=f"{h.DONE} *done*"))
+    elif require:
+        return False
     src = state.get("source_message_id")
     if src:
         h.discord_react(src, h.SEEN, add=False)
@@ -129,26 +128,27 @@ def main():
 
     # re-read: hook-progress may have created the status message during the poll.
     state = h.load_turn(sid) or state
-    # Pure-output turn (no tools, no intermediate narration): the live status block already
-    # shows the whole answer, so finalize THAT in place rather than wiping it to an empty
-    # work block and reposting — the wipe is a jarring disappear-while-reading. Needs a
-    # status message and a one-message answer; otherwise post the answer separately.
-    fits_one_message = bool(text) and len(text) <= h.BODY_CAP - 40
-    in_place = bool(state.get("message_id")) and not h.work_lines(turn) and not already_sent and fits_one_message
+    # The closing answer is already in the live status block (live-narration put it there;
+    # the block is append-only). Decorate THAT done rather than reposting — never remove the
+    # closing from the block to avoid a double. Post a separate message ONLY when the block
+    # can't hold the answer (too long) or doesn't exist, so the answer is still guaranteed.
+    fits = bool(text) and len(text) <= h.BODY_CAP - 40
+    in_block = bool(state.get("message_id")) and fits and not already_sent
 
     if already_sent:
         h.log_event("Stop", {"outcome": "skip", "reason": "already_sent"})
-    elif in_place:
-        h.log_event("Stop", {"outcome": "in_place", "chars": len(text)})
+    elif in_block:
+        h.log_event("Stop", {"outcome": "in_block", "chars": len(text)})
     elif not deliver(sid, text):
         return
 
     # Locked + re-read for the freshest message_id, then tombstone the turn so a straggler
     # render can't resurrect it (the freeze and a trailing MessageDisplay can land in either
-    # order). An in-place finalize that can't land falls back to a normal post — never drop.
+    # order). finalize renders turn_lines + ✅; if the answer lives only there (in_block) and
+    # the edit can't land, fall back to a separate post — never drop.
     with h.turn_lock(sid):
         state = h.load_turn(sid) or state
-        if not finalize(state, turn, answer=text if in_place else None) and not deliver(sid, text):
+        if not finalize(state, turn, require=in_block) and not deliver(sid, text):
             return
         if tid is not None:
             state["done"] = tid

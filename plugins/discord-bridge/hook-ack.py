@@ -23,12 +23,15 @@ def main():
     event = h.read_event("UserPromptSubmit")
     sid = event.get("session_id")
     mid = source_message_id(event.get("prompt"))
+    # Reset per-turn state every turn (clearing the prior turn's done tombstone), whether
+    # or not this prompt carries a source message to react to.
+    with h.turn_lock(sid):
+        h.save_turn(sid, {"source_message_id": mid} if mid else {})
     if not mid:
         h.log_event("UserPromptSubmit", {"outcome": "no_source_message"})
         return
     ok = h.discord_react(mid, h.SEEN)
     h.log_event("UserPromptSubmit", {"outcome": "react" if ok else "react_failed", "source": mid})
-    h.save_turn(sid, {"source_message_id": mid})
 
 
 if __name__ == "__main__":

@@ -13,39 +13,56 @@ import sys
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import _hooklib as h
+import transcript as t
 
 
 def main():
     event = h.read_event("PostToolUse")
     sid = event.get("session_id")
-    full = h.lines_from_path(event.get("transcript_path"))
+    is_md = event.get("hook_event_name") == "MessageDisplay"
+    turn = h.turn_from_path(event.get("transcript_path"))
+    full = h.turn_lines(turn)
+    tid = t.turn_id(turn)
 
-    state = h.load_turn(sid) or {}
-    base = state.get("base", 0)
-    shown = state.get("shown", 0)
-    mid = state.get("message_id")
+    # Locked so a concurrent PostToolUse + MessageDisplay can't both lazy-create the
+    # status message; the second to enter sees the message_id and edits instead.
+    with h.turn_lock(sid):
+        state = h.load_turn(sid) or {}
+        if tid is not None and state.get("done") == tid:
+            return  # THIS turn already finalized by the Stop hook — don't resurrect it
 
-    if mid:
-        latest = h.discord_latest()
-        if latest and latest != mid:
-            base, mid = shown, None  # freeze the old message; the new one starts here
+        # Drop the live narration once the transcript commits it, so it never doubles.
+        live = h.track_live(state, event) if is_md else h.live_text(state.get("live"))
+        if live and ("text", live) in full:
+            state.pop("live", None)
+            live = ""
 
-    lines = full[base:]
-    if not lines:
-        return  # nothing new to show yet — never post a content-less status message
+        base = state.get("base", 0)
+        shown = state.get("shown", 0)
+        mid = state.get("message_id")
 
-    body = h.render(lines)
-    if mid:
-        if body == state.get("last_body"):
-            return  # unchanged — MessageDisplay can fire repeatedly mid-block; skip the redundant edit
-        h.discord_edit(mid, body)
-    else:
-        mid = h.discord_send(body)
-        if not mid:
-            return
-        state["message_id"] = mid
-    state.update(base=base, shown=len(full), last_body=body)
-    h.save_turn(sid, state)
+        if mid and not is_md:
+            latest = h.discord_latest()  # re-home on tool boundaries, not per narration segment
+            if latest and latest != mid:
+                base, mid = shown, None  # freeze the old message; the new one starts here
+
+        lines = full[base:]
+        if live:
+            lines = lines + [("text", live)]
+        if not lines:
+            return  # nothing new to show yet — never post a content-less status message
+
+        body = h.render(lines, footer=f"{h.WORKING} *working…*")
+        if mid:
+            if body == state.get("last_body"):
+                return  # unchanged — MessageDisplay can fire repeatedly mid-block; skip the redundant edit
+            h.discord_edit(mid, body)
+        else:
+            mid = h.discord_send(body)
+            if not mid:
+                return
+        state.update(base=base, shown=len(full), last_body=body, message_id=mid)
+        h.save_turn(sid, state)
 
 
 if __name__ == "__main__":

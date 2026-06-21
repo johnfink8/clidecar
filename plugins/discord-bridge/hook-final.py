@@ -80,6 +80,12 @@ def main():
     except ValueError as e:
         return fail(sid, f"couldn't parse transcript (check console). {str(e)[:200]}")
 
+    tid = t.turn_id(turn)
+    if tid is not None and state.get("done") == tid:
+        # THIS exact turn's closing was already posted — a re-entrant Stop.
+        h.log_event("Stop", {"outcome": "skip", "reason": "already_finalized", "turn": tid})
+        return
+
     text, already_sent = t.extract_closing(turn)
 
     if not flushed:
@@ -105,8 +111,18 @@ def main():
             return fail(sid, f"Discord refused the final post — answer {where}; check console.")
         h.log_event("Stop", {"outcome": "sent", "parts": len(sent_ids), "ids": sent_ids})
 
-    mark_done(state, turn)
-    h.clear_turn(sid)
+    # Locked + re-read: hook-progress may have created the status message while we polled
+    # for the closing, so take the freshest message_id, then tombstone the turn so a
+    # straggler render can't resurrect it (the freeze and a trailing MessageDisplay can
+    # land in either order).
+    with h.turn_lock(sid):
+        state = h.load_turn(sid) or state
+        mark_done(state, turn)
+        if tid is not None:
+            state["done"] = tid
+            h.save_turn(sid, state)
+        else:
+            h.clear_turn(sid)
 
 
 if __name__ == "__main__":

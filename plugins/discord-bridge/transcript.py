@@ -78,6 +78,18 @@ def current_turn(rows):
     return rows[start:]
 
 
+def turn_id(turn):
+    """A stable identifier for the turn — the uuid of its starting human prompt. Used to
+    scope the Stop hook's 'done' tombstone to the exact turn it finalized, so a stale
+    tombstone (e.g. a --resume into a session whose UserPromptSubmit never re-fired) can't
+    suppress a real turn's status or silently drop its closing answer. None if no id can
+    be derived, in which case callers fall back to a non-tombstone (delete) path."""
+    if not turn:
+        return None
+    first = turn[0]
+    return first.get("uuid") or first.get("promptId") or first.get("timestamp") or None
+
+
 def closing_flushed(turn):
     """True once the turn's closing assistant text is durably in the transcript.
 

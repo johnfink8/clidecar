@@ -4,7 +4,9 @@ Per-turn state is one JSON file keyed by session id so the three hooks — which
 as separate processes — can find the same ack message. Discord I/O is delegated to
 bin/discord-msg.sh (single source of the bot-API call).
 """
+import contextlib
 import datetime
+import fcntl
 import json
 import os
 import subprocess
@@ -22,6 +24,7 @@ DISCORD_MSG = os.path.join(BIN, "discord-msg.sh")
 
 SEEN = "👀"
 DONE = "✅"
+WORKING = "⏳"
 BODY_CAP = 1900  # headroom under Discord's 2000-char message limit
 TOOL_CAP = 120   # tool summaries stay one tidy line; narrations are never capped
 
@@ -44,10 +47,9 @@ def summarize_tool(tool_name, tool_input):
 
 
 def turn_lines(turn):
-    """Ordered (kind, text) items for the turn: ("text", full narration) and
-    ("tool", summary). Narrations are kept WHOLE — they carry intent and reasoning, so
-    they're never truncated; only tool summaries are length-capped (at render). Discord
-    replies are skipped — they're their own visible messages, not work worth a line."""
+    """Narrations are kept WHOLE — they carry intent and reasoning, so they're never
+    truncated; only tool summaries are length-capped (at render). Discord replies are
+    skipped — they're their own visible messages, not work worth a line."""
     items = []
     for o in turn:
         for b in t.assistant_blocks(o) or []:
@@ -74,6 +76,31 @@ def work_lines(turn):
     return items
 
 
+def track_live(state, event):
+    """MessageDisplay fires as each text segment is displayed, BEFORE the assistant
+    message is committed to the transcript — so accumulating its deltas (keyed by index,
+    in state["live"]) is the only way to surface a narration before the next tool
+    re-renders. Keyed by the display message_id; a new message resets the buffer."""
+    md_id = event.get("message_id")
+    live = state.get("live") or {}
+    if live.get("message_id") != md_id:
+        live = {"message_id": md_id, "segments": {}}
+    delta = event.get("delta")
+    if isinstance(delta, str):
+        live["segments"][str(event.get("index", 0))] = delta
+    state["live"] = live
+    return live_text(live)
+
+
+def live_text(live):
+    """The join of the segments reproduces the committed text exactly, so callers can drop
+    the live narration by identity once it lands in the transcript. "" if no buffer."""
+    if not live:
+        return ""
+    segs = live.get("segments") or {}
+    return "".join(segs[k] for k in sorted(segs, key=int)).strip()
+
+
 def render(items, footer=None):
     """Newest-first fit of items into one Discord message: narrations whole, tool
     summaries one-line-capped. Oldest WHOLE items roll off only if the block would
@@ -92,22 +119,26 @@ def render(items, footer=None):
     return "\n".join(kept)[:1990]
 
 
-def lines_from_path(path):
-    """All progress lines for the transcript's current turn; [] if unreadable —
-    progress is best-effort and must never crash a turn."""
+def turn_from_path(path):
+    """The transcript's current-turn rows; [] if unreadable — progress is best-effort
+    and must never crash a turn."""
     try:
-        turn = t.current_turn(t.load_rows(path)) if path else []
+        return t.current_turn(t.load_rows(path)) if path else []
     except (OSError, ValueError):
         return []
-    return turn_lines(turn)
+
+
+def lines_from_path(path):
+    """All progress lines for the transcript's current turn."""
+    return turn_lines(turn_from_path(path))
 
 
 def read_event(event_name=None):
     """Parse the hook's stdin JSON; {} if unparseable so a hook never crashes a turn.
-    When event_name is set, raw stdin is logged (diagnostic, kept during the bridge
-    proving phase) under the payload's real hook_event_name — so a script shared across
-    events, like the progress renderer on both PostToolUse and MessageDisplay, logs each
-    under its true name rather than a hard-coded label."""
+    When event_name is set, raw stdin is logged under the payload's real
+    hook_event_name — so a script shared across events, like the progress renderer on
+    both PostToolUse and MessageDisplay, logs each under its true name rather than a
+    hard-coded label."""
     raw = sys.stdin.read()
     try:
         parsed = json.loads(raw or "{}")
@@ -171,6 +202,29 @@ def clear_turn(session_id):
         os.remove(turn_state_path(session_id))
     except FileNotFoundError:
         pass
+
+
+@contextlib.contextmanager
+def turn_lock(session_id):
+    """PostToolUse, MessageDisplay and Stop fire as separate processes that all mutate
+    the one status message; without this lock they race and double-create it. Best-effort:
+    if the lock can't be acquired the body still runs — conceding a duplicate status
+    message and a possible post-freeze resurrection of the cosmetic status block, but never
+    a lost closing answer, which the Stop hook delivers (and persists/pings on failure)
+    outside this section."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fh = None
+    try:
+        fh = open(turn_state_path(session_id) + ".lock", "w")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    except OSError:
+        fh = None
+    try:
+        yield
+    finally:
+        if fh is not None:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
 
 
 def discord_send(text, reply_to=None):

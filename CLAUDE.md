@@ -15,6 +15,12 @@ own supervisor. Full design in [SPEC.md](SPEC.md); user-facing overview in
   untouched (`KillMode=process`). This bit us on the first dogfood recycle.
 - **`config.env` changes ARE picked up live** — `launch_claude` re-sources it on
   every (re)launch. Only sidecar *code* changes need a reload.
+- **Hook/plugin script edits are LIVE immediately; only `settings.json` registration
+  needs a recycle.** Claude Code re-executes a command-hook's script file on every
+  invocation, so editing a plugin's `*.py`/`*.sh` takes effect mid-session. But *which*
+  hooks are registered (`.claude/settings.json`) loads once at launch — so
+  `clidecar plugin enable/disable` (and moving hook files) needs a `clidecar recycle`
+  to take effect. (Distinct from `bin/sidecar.sh`, which needs `clidecar reload`.)
 - **Validate bash before it goes live**: `bash -n bin/sidecar.sh`. A sidecar that
   crashes on start trips systemd StartLimit → `OnFailure` restores `known-good/`.
 - **Test recycles cost a context reset** — checkpoint to `~/.clidecar/state/state.md`
@@ -27,10 +33,15 @@ own supervisor. Full design in [SPEC.md](SPEC.md); user-facing overview in
 ## Architecture map
 
 - `bin/sidecar.sh` — supervisor loop: launch → wait-for-event → recycle/relaunch.
-- `bin/clidecar` — control CLI (recycle / set / reload / status / logs / down / up).
-  Symlinked onto PATH; resolves its own symlink to find the repo root.
+- `bin/clidecar` — control CLI (recycle / set / reload / status / logs / down / up /
+  plugin). Symlinked onto PATH; resolves its own symlink to find the repo root.
 - `bin/notify-discord.sh` — bot-API ping for code paths that can't reach the MCP.
 - `bin/fallback.sh` — OnFailure one-shot: restore known-good sidecar, notify.
+- `bin/_pluginctl.py` — enable/disable/list plugins by editing `.claude/settings.json`.
+- `plugins/<name>/` — optional hook plugins, each self-contained with a `plugin.json`
+  (a Claude Code hooks fragment using a `${PLUGIN_DIR}` placeholder). `discord-bridge`
+  is the Discord output bridge (👀 ack reaction, live status mirror, deterministic
+  Stop-hook final answer). Enable with `clidecar plugin enable <name>` + recycle.
 - `systemd/` — the supervisor unit + the OnFailure unit.
 - `~/.clidecar/control/` — runtime flags (`RECYCLE`) + `claude.pid`.
 - `~/.clidecar/state/` — live `state.md` (the "now") + `queue.md` (backlog).

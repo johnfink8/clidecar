@@ -3,7 +3,10 @@
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/bin/hook-ack.py" }
+          {
+            "type": "command",
+            "command": "/home/john/clidecar/plugins/discord-bridge/hook-ack.py"
+          }
         ]
       }
     ],
@@ -11,14 +14,20 @@
       {
         "matcher": "*",
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/bin/hook-progress.py" }
+          {
+            "type": "command",
+            "command": "/home/john/clidecar/plugins/discord-bridge/hook-progress.py"
+          }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/bin/hook-final.py" }
+          {
+            "type": "command",
+            "command": "/home/john/clidecar/plugins/discord-bridge/hook-final.py"
+          }
         ]
       }
     ]

@@ -8,6 +8,7 @@
 #   clidecar logs [N]          # last N journald lines (default 50)
 #   clidecar down              # stop sidecar AND kill the managed Claude
 #   clidecar up                # (re)start the sidecar service
+#   clidecar plugin list|enable|disable [name]   # manage hook plugins (recycle to apply)
 set -uo pipefail
 # Resolve symlinks so invocation via ~/.local/bin/clidecar still points at the
 # real repo (else CLIDECAR_HOME would be ~/.local and recycle flags land in a
@@ -90,6 +91,10 @@ case "$cmd" in
     echo "sidecar stopped and managed Claude killed."
     ;;
   up)     systemctl --user start clidecar && echo "sidecar started." ;;
+  plugin)
+    sub="${1:-list}"; shift || true
+    python3 "$CLIDECAR_HOME/bin/_pluginctl.py" "$CLIDECAR_HOME" "$sub" "$@"
+    ;;
   *)
     grep -E '^#( |$)' "$0" | sed -E 's/^# ?//' | sed -n '2,20p'
     ;;

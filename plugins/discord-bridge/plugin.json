@@ -1,0 +1,15 @@
+{
+  "name": "discord-bridge",
+  "description": "Console-faithful Discord output: 👀 ack reaction on your message, a live status message mirroring narration + tool calls (re-homed below mid-turn messages), and a deterministic Stop-hook that posts the turn's closing answer regardless of whether the model called the reply tool.",
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "${PLUGIN_DIR}/hook-ack.py" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "${PLUGIN_DIR}/hook-progress.py" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "${PLUGIN_DIR}/hook-final.py" }] }
+    ]
+  }
+}

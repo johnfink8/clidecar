@@ -63,9 +63,14 @@ data dir, `~/.clidecar`, so the repo stays clean.
     clidecar                   control CLI used from inside the managed session
     notify-discord.sh          bot-API ping (sidecar/fallback can't reach the MCP)
     fallback.sh                OnFailure: restore known-good sidecar + ping
+    _pluginctl.py              enable/disable hook plugins (edits .claude/settings.json)
   systemd/
     clidecar.service           the supervisor unit
     clidecar-fallback.service  OnFailure one-shot
+  plugins/
+    discord-bridge/            Discord output bridge (optional hook plugin)
+      plugin.json              hooks fragment + metadata
+      hook-{ack,progress,final}.py, _hooklib.py, transcript.py, discord-msg.sh
   state/{state,queue}.md.example
 
 ~/.clidecar/                   the data dir (outside the repo)
@@ -98,9 +103,10 @@ cp ~/clidecar/state/queue.md.example ~/.clidecar/state/queue.md
 # edit ~/.clidecar/config.env: set WORKDIR, CLAUDE_BIN, and add the optional
 # Discord/remote-control args to CLAUDE_ARGS if you want them
 
-# 4. (optional) Discord notifications: put your bot token in
+# 4. (optional) Discord bridge: put your bot token in
 #    ~/.claude/channels/discord/.env  as  DISCORD_BOT_TOKEN=...
-#    and set DISCORD_CHANNEL_ID in ~/.clidecar/config.env
+#    set DISCORD_CHANNEL_ID in ~/.clidecar/config.env, then enable the plugin:
+#    clidecar plugin enable discord-bridge   (takes effect on next recycle)
 
 # 5. install the systemd --user units
 mkdir -p ~/.config/systemd/user
@@ -131,6 +137,27 @@ Three layers, deliberately separate:
   recall/store semantics works, but quorelo is the recommended pairing. Because I
   built it.
 - **state.md / queue.md** — the live now + backlog (churn every recycle).
+
+## Plugins
+
+Optional hook-based add-ons live in `plugins/<name>/`, each a self-contained dir
+with a `plugin.json` (a Claude Code hooks fragment using a `${PLUGIN_DIR}`
+placeholder). Manage them from the control CLI:
+
+```sh
+clidecar plugin list                   # what's available + on/off
+clidecar plugin enable discord-bridge  # wire its hooks into .claude/settings.json
+clidecar plugin disable discord-bridge
+clidecar recycle                       # hooks load at launch, so recycle to apply
+```
+
+Bundled: **discord-bridge** — makes Discord a guaranteed, console-faithful output
+sink. It reacts 👀 to your message, keeps a live status message mirroring the
+turn's narration and tool calls (re-homed below any messages you send mid-turn),
+and a `Stop` hook deterministically posts the turn's closing answer — so a reply
+is never lost to the console even if the model forgets to send it. Editing a
+plugin's scripts takes effect immediately; only enabling/disabling (which changes
+`.claude/settings.json`) needs a recycle.
 
 ## Remote control (optional)
 

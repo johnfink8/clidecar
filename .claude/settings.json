@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/john/clidecar/plugins/discord-bridge/hook-ack.py"
+            "command": "/home/john/clidecar/bridge/hook-ack.py"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/john/clidecar/plugins/discord-bridge/hook-progress.py"
+            "command": "/home/john/clidecar/bridge/hook-progress.py"
           }
         ]
       }
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/john/clidecar/plugins/discord-bridge/hook-final.py"
+            "command": "/home/john/clidecar/bridge/hook-final.py"
           }
         ]
       }
@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/john/clidecar/plugins/discord-bridge/hook-progress.py"
+            "command": "/home/john/clidecar/bridge/hook-progress.py"
           }
         ]
       }

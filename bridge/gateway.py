@@ -18,6 +18,7 @@ Wire contract (verified against the official discord channel server):
 """
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -30,9 +31,14 @@ SERVER_NAME = "clidecar"
 SERVER_VERSION = "0.1.0"
 PROTOCOL_FALLBACK = "2024-11-05"
 POLL_INTERVAL_S = 3.0
-POLL_FAIL_ALERT_AFTER = 5  # ~15s of dead polls before escalating out-of-band
+TRANSPORT_TIMEOUT_S = 30.0  # bound each adapter shell-out so a hung/429-sleeping call can't wedge us
+POLL_FAIL_ALERT_AFTER = 5   # consecutive dead polls / listener restarts before re-escalating
+LISTEN_FATAL_EXIT = 4       # listen.py (FATAL_EXIT) says "WS won't recover — fall back to poll"
+LISTEN_HEALTHY_RUN_S = 30.0  # a listener run this long counts as a healthy connection that dropped
+LISTEN_MAX_RESTARTS = 5     # consecutive unhealthy listener restarts before falling back to poll
 
 EVENTS_LOG = os.path.expanduser("~/.clidecar/state/gateway-events.jsonl")
+LISTEN_ERR_LOG = os.path.expanduser("~/.clidecar/state/listen-stderr.log")
 NOTIFY = os.path.expanduser("~/clidecar/bin/notify-discord.sh")
 
 
@@ -89,12 +95,17 @@ def _error(req_id: object, code: int, message: str) -> None:
 
 def _transport(*args: str) -> "tuple[int, str]":
     """The single shell-out point — same resolution the outbound hooks use, so the gateway never
-    names a transport."""
+    names a transport. Timeout-bounded so a hung or rate-limit-sleeping adapter call can't wedge
+    the caller (the poll path's silent-stall mode)."""
     script, reason = channel.transport()
     if not script:
         sys.stderr.write(f"clidecar gateway: no channel resolved — {reason}\n")
         return 1, ""
-    out = subprocess.run([script, *args], capture_output=True, text=True)
+    try:
+        out = subprocess.run([script, *args], capture_output=True, text=True, timeout=TRANSPORT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"clidecar gateway: adapter {args[0] if args else '?'!r} timed out after {TRANSPORT_TIMEOUT_S}s\n")
+        return 124, ""
     if out.returncode != 0:
         sys.stderr.write(out.stderr)
     return out.returncode, out.stdout
@@ -265,6 +276,134 @@ def poll_loop(stop: threading.Event) -> None:
         stop.wait(POLL_INTERVAL_S)
 
 
+_active_child: "subprocess.Popen[str] | None" = None
+_child_lock = threading.Lock()
+
+
+def _last_line(path: str) -> str:
+    """Last non-blank line of the listener's stderr file — the actual failure reason to surface."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+    except OSError:
+        return ""
+    return lines[-1] if lines else ""
+
+
+def _terminate_child() -> None:
+    """Kill the listener subprocess on shutdown so a recycle doesn't orphan a live WS connection.
+    Waits (then SIGKILLs) so the socket is torn down before we exit — no momentary double-connect."""
+    with _child_lock:
+        proc = _active_child
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    except OSError:
+        pass
+
+
+def listen_loop(stop: threading.Event) -> bool:
+    """Stream inbound from an adapter that declares `listen` (push): read gate.shape() JSON lines
+    from the long-running adapter process and emit each as a channel envelope — no polling, no
+    cursor. listen.py handles its own transient reconnects, so an exit is meaningful: a fatal one
+    (token / intent / gave-up) or a crash that keeps recurring. Either way we restart with backoff
+    and re-escalate on repeat, then fall back to REST polling so inbound is never left dead and
+    silent. Returns True to hand off to poll_loop; False only when stopped."""
+    global _active_child
+    fails = 0
+    backoff = 1.0
+    while not stop.is_set():
+        script, reason = channel.transport()
+        if not script:
+            fails += 1
+            log_event("listen_error", {"error": f"unresolved channel: {reason}", "consecutive": fails})
+            if fails % POLL_FAIL_ALERT_AFTER == 0:
+                alert(f"⚠️ clidecar inbound: channel unresolved — {reason}")
+            stop.wait(backoff)
+            backoff = min(backoff * 2, 30.0)
+            continue
+        errf = None
+        try:
+            errf = open(LISTEN_ERR_LOG, "w", encoding="utf-8")
+        except OSError:
+            pass
+        started = time.monotonic()
+        try:
+            proc = subprocess.Popen([script, "listen"], stdout=subprocess.PIPE, stderr=errf, text=True)
+        except OSError as e:
+            if errf:
+                errf.close()
+            fails += 1
+            log_event("listen_error", {"error": repr(e), "consecutive": fails})
+            stop.wait(backoff)
+            backoff = min(backoff * 2, 30.0)
+            continue
+        with _child_lock:
+            _active_child = proc
+        log_event("listen_start", {})
+        delivered = False
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                obj = cast("dict[str, object]", parsed)
+                mid = obj.get("id")
+                if not isinstance(mid, str):
+                    log_event("listen_drop_no_id", {"msg": obj})
+                    continue
+                _emit_inbound(obj)
+                log_event("delivered", {"message_id": mid, "via": "listen"})
+                delivered = True
+        code = proc.wait()
+        ran = time.monotonic() - started
+        with _child_lock:
+            _active_child = None
+        if errf:
+            errf.close()
+        if stop.is_set():
+            return False
+        why = _last_line(LISTEN_ERR_LOG)
+        if code == LISTEN_FATAL_EXIT:
+            log_event("listen_fatal", {"code": code, "stderr": why})
+            alert(f"⚠️ clidecar inbound (WS) fatally unavailable — {why or 'token / MESSAGE_CONTENT intent'}; "
+                  "falling back to REST polling.")
+            return True
+        fails = 0 if (delivered or ran >= LISTEN_HEALTHY_RUN_S) else fails + 1
+        backoff = 1.0 if fails == 0 else backoff
+        log_event("listen_exit", {"code": code, "consecutive": fails, "ran_s": round(ran, 1), "stderr": why})
+        sys.stderr.write(f"clidecar gateway: listener exited ({code}) after {ran:.0f}s; restart {fails}\n")
+        if fails >= LISTEN_MAX_RESTARTS:
+            alert(f"⚠️ clidecar inbound (WS): listener died {fails}x (last exit {code}: {why}) — "
+                  "falling back to REST polling.")
+            return True
+        stop.wait(backoff)
+        backoff = min(backoff * 2, 30.0)
+    return False
+
+
+def inbound_loop(stop: threading.Event) -> None:
+    """Prefer push (`listen`) when the adapter declares it; fall back to REST polling if the
+    listener is fatally unavailable or the adapter only does `poll`."""
+    if bool(channel.capabilities().get("listen")) and listen_loop(stop):
+        if not stop.is_set():
+            log_event("inbound_fallback", {"to": "poll"})
+            poll_loop(stop)
+    elif not bool(channel.capabilities().get("listen")):
+        poll_loop(stop)
+
+
 def handle_request(method: str, req_id: object, params: "dict[str, object]") -> None:
     if method == "initialize":
         requested = params.get("protocolVersion")
@@ -296,7 +435,16 @@ def handle_request(method: str, req_id: object, params: "dict[str, object]") -> 
 
 def main() -> int:
     stop = threading.Event()
-    threading.Thread(target=poll_loop, args=(stop,), daemon=True).start()
+
+    def on_signal(_signum: int, _frame: object) -> None:
+        stop.set()
+        _terminate_child()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    threading.Thread(target=inbound_loop, args=(stop,), daemon=True).start()
     sys.stderr.write(f"clidecar gateway: up as channel {SERVER_NAME!r}\n")
 
     for line in sys.stdin:
@@ -321,6 +469,7 @@ def main() -> int:
         # else: a client notification (e.g. notifications/initialized) — no reply expected.
 
     stop.set()
+    _terminate_child()
     return 0
 
 

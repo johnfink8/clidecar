@@ -1,7 +1,7 @@
 {
   "name": "discord",
   "kind": "messaging",
-  "description": "Discord messaging adapter: send/edit/react/latest/cursor/poll via the bot API. Knows nothing about Claude — the clidecar bridge core drives it.",
+  "description": "Discord messaging adapter: send/edit/react/latest/cursor/poll/listen via the bot API + Gateway WS. Knows nothing about Claude — the clidecar bridge core drives it.",
   "transport": "${PLUGIN_DIR}/msg.sh",
-  "capabilities": { "edit": true, "react": true, "latest": true, "poll": true, "cursor": true }
+  "capabilities": { "edit": true, "react": true, "latest": true, "poll": true, "cursor": true, "listen": true }
 }

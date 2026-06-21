@@ -9,7 +9,8 @@
 #   discord-msg.sh unreact <message_id> <emoji> [channel]  -> remove the bot's reaction
 #   discord-msg.sh latest                                  -> prints the newest message id
 #   discord-msg.sh cursor                                  -> inbound baseline (newest id, or now)
-#   discord-msg.sh poll    [after_message_id]              -> JSON lines of new inbound msgs
+#   discord-msg.sh poll    [after_message_id]              -> JSON lines of new inbound msgs (REST)
+#   discord-msg.sh listen                                  -> stream inbound JSON lines (Gateway WS)
 #
 # Every call retries on HTTP 429 honoring Discord's retry_after — the reaction endpoint
 # shares a strict bucket, so the remove-👀 + add-✅ swap reliably rate-limits the second
@@ -108,6 +109,12 @@ print(d[0]["id"] if d and "id" in d[0] else ((int(time.time()*1000)-142007040000
     if [ -n "$after" ]; then url="${API}?limit=50&after=${after}"; else url="${API}?limit=50"; fi
     api_call GET "$url" || { echo "discord-msg: poll FAILED" >&2; exit 1; }
     printf '%s' "$RESP" | python3 "$(dirname "$0")/poll.py"
+    ;;
+  listen)
+    # Long-running push stream over the Gateway WS. exec so the core's reader gets python's
+    # stdout directly; pass creds explicitly in case the .env didn't export them.
+    DISCORD_BOT_TOKEN="$DISCORD_BOT_TOKEN" DISCORD_CHANNEL_ID="$DISCORD_CHANNEL_ID" \
+      exec python3 "$(dirname "$0")/listen.py"
     ;;
   *)
     echo "usage: discord-msg.sh send \"text\" [reply_to] | edit <id> \"text\" | react|unreact <id> <emoji> [chan]" >&2

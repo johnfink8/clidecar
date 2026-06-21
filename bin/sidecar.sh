@@ -22,6 +22,9 @@ CLIDECAR_DATA="$HOME/.clidecar"
 export CLIDECAR_HOME CLIDECAR_DATA
 CONTROL_DIR="$CLIDECAR_DATA/control"
 PIDFILE="$CONTROL_DIR/claude.pid"
+GATEWAY_PIDFILE="$CONTROL_DIR/gateway.pid"
+GATEWAY_SCRIPT="$CLIDECAR_HOME/bridge/gateway.py"
+GATEWAY_LOG="$CLIDECAR_DATA/state/gateway-daemon.log"
 CONFIG_FILE="$CLIDECAR_DATA/config.env"
 KNOWN_GOOD="$CLIDECAR_DATA/known-good/sidecar.sh"
 mkdir -p "$CONTROL_DIR" "$CLIDECAR_DATA/state" "$CLIDECAR_DATA/known-good"
@@ -48,6 +51,45 @@ claude_alive() {
   # actually contains "claude" — else we'd falsely "adopt" a stranger and never
   # launch a fresh claude (a silent false-healthy). grep -a: cmdline is NUL-sep.
   grep -qa claude "/proc/$p/cmdline" 2>/dev/null
+}
+
+# The persistent gateway daemon owns the Discord WS + broker socket + inbound routing, surviving
+# both supervisor reloads (adopted, not killed) and Claude recycles. Only managed when
+# GATEWAY_DAEMON=1: until the cutover that flips CC onto the stdio shim, the gateway still runs the
+# old way (as CC's own MCP child), so this entire lane stays INERT and a `clidecar reload` can't
+# spawn a competing daemon. Detached via setsid so a supervisor restart doesn't drag it down.
+gateway_enabled() { [ "${GATEWAY_DAEMON:-0}" = 1 ]; }
+gateway_pid()     { cat "$GATEWAY_PIDFILE" 2>/dev/null; }
+gateway_alive() {
+  local p; p="$(gateway_pid)"
+  [ -n "$p" ] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  # PID-reuse guard, same as claude: only ours if the live cmdline really is the gateway.
+  grep -qa "gateway.py" "/proc/$p/cmdline" 2>/dev/null
+}
+
+launch_gateway() {
+  load_config
+  gateway_enabled || return 0
+  rm -f "$GATEWAY_PIDFILE"
+  local py="${PYTHON_BIN:-python3}"
+  # the inner shell records its own PID then exec's python, so PIDFILE == the daemon process
+  setsid bash -lc "echo \$\$ > $(printf %q "$GATEWAY_PIDFILE") && exec $(printf %q "$py") $(printf %q "$GATEWAY_SCRIPT")" \
+    >> "$GATEWAY_LOG" 2>&1 &
+  sleep 1
+  log "launched gateway daemon pid=$(gateway_pid)"
+}
+
+stop_gateway() {
+  load_config
+  local p; p="$(gateway_pid)"
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+    log "SIGTERM gateway ($p); grace ${GRACE_SECS}s"
+    kill -TERM "$p" 2>/dev/null || true
+    for _ in $(seq 1 "$GRACE_SECS"); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+    kill -0 "$p" 2>/dev/null && { log "SIGKILL gateway ($p)"; kill -KILL "$p" 2>/dev/null || true; }
+  fi
+  rm -f "$GATEWAY_PIDFILE"
 }
 
 # --dangerously-load-development-channels shows a blocking, per-launch modal at startup
@@ -159,6 +201,14 @@ trap 'log "received TERM/INT — exiting (claude left running for adoption)"; ex
 
 log "starting (CLIDECAR_HOME=$CLIDECAR_HOME)"
 load_config
+# Gateway BEFORE claude: the daemon must be serving the broker socket before CC's shim attaches.
+if gateway_enabled; then
+  if gateway_alive; then
+    log "adopted running gateway (pid=$(gateway_pid))"
+  else
+    launch_gateway
+  fi
+fi
 if claude_alive; then
   log "adopted running claude (pid=$(claude_pid)) — not relaunching"
 else
@@ -167,12 +217,23 @@ fi
 
 while true; do
   wait_for_event
+  if [ -e "$CONTROL_DIR/GATEWAY_RELOAD" ]; then
+    rm -f "$CONTROL_DIR/GATEWAY_RELOAD"
+    log "GATEWAY_RELOAD requested"
+    stop_gateway
+    launch_gateway         # restart the daemon WITHOUT recycling Claude's context
+    continue
+  fi
   if [ -e "$CONTROL_DIR/RECYCLE" ]; then
     rm -f "$CONTROL_DIR/RECYCLE"
     log "RECYCLE requested"
     graceful_kill
     launch_claude          # deliberate recycle: not counted toward crash-loop
     continue
+  fi
+  if gateway_enabled && ! gateway_alive; then
+    log "gateway not alive — relaunching"
+    launch_gateway
   fi
   if ! claude_alive; then
     log "claude not alive — relaunching"

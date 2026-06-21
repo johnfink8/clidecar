@@ -9,6 +9,7 @@
 #   clidecar down              # stop sidecar AND kill the managed Claude
 #   clidecar up                # (re)start the sidecar service
 #   clidecar plugin list|enable|disable [name]   # manage hook plugins (recycle to apply)
+#   clidecar gateway reload|status|logs [N]      # manage the persistent gateway daemon
 set -uo pipefail
 # Resolve symlinks so invocation via ~/.local/bin/clidecar still points at the
 # real repo (else CLIDECAR_HOME would be ~/.local and recycle flags land in a
@@ -94,6 +95,27 @@ case "$cmd" in
   plugin)
     sub="${1:-list}"; shift || true
     python3 "$CLIDECAR_HOME/bin/_pluginctl.py" "$CLIDECAR_HOME" "$sub" "$@"
+    ;;
+  gateway)
+    # Manage the persistent gateway daemon. `reload` restarts the daemon (re-reads bridge/gateway.py
+    # core) WITHOUT touching Claude's context — the supervisor catches the flag on its next loop.
+    sub="${1:-status}"; shift || true
+    case "$sub" in
+      reload)
+        touch "$CONTROL/GATEWAY_RELOAD"
+        echo "GATEWAY_RELOAD dropped — supervisor will restart the daemon (Claude untouched)."
+        ;;
+      status)
+        p="$(cat "$CONTROL/gateway.pid" 2>/dev/null || true)"
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+          echo "gateway daemon running (pid=$p)"
+        else
+          echo "gateway daemon NOT running"
+        fi
+        ;;
+      logs) tail -n "${1:-50}" "$CLIDECAR_DATA/state/gateway-daemon.log" 2>/dev/null || echo "(no gateway log yet)" ;;
+      *) echo "usage: clidecar gateway reload|status|logs [N]" >&2; exit 1 ;;
+    esac
     ;;
   *)
     grep -E '^#( |$)' "$0" | sed -E 's/^# ?//' | sed -n '2,20p'

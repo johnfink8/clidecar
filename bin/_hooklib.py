@@ -40,15 +40,14 @@ def summarize_tool(tool_name, tool_input):
         return f"🔎 {ti.get('pattern') or ti.get('query') or ''}"
     if tool_name in ("Task", "Agent"):
         return f"🤖 {ti.get('description') or 'subagent'}"
-    if t.is_discord_reply(tool_name):
-        return "💬 discord reply"
     return f"🔧 {tool_name}"
 
 
 def turn_lines(turn):
     """Each assistant text block collapses to its first line — a progress ticker, not a
     transcript dump (the full closing answer is the separate Stop message); each tool_use
-    becomes one summarized line."""
+    becomes one summarized line. Discord replies are skipped — they're their own visible
+    messages, not work worth a status line."""
     lines = []
     for o in turn:
         for b in t.assistant_blocks(o) or []:
@@ -58,7 +57,7 @@ def turn_lines(turn):
                 head = next((ln.strip() for ln in b.get("text", "").splitlines() if ln.strip()), "")
                 if head:
                     lines.append(f"💬 {head}")
-            elif b.get("type") == "tool_use":
+            elif b.get("type") == "tool_use" and not t.is_discord_reply(b.get("name")):
                 lines.append(summarize_tool(b.get("name", ""), b.get("input")))
     return lines
 
@@ -67,17 +66,17 @@ def render(lines, footer=None):
     parts = [f"`{ln[:LINE_CAP]}`" for ln in lines[-MAX_LINES:]]
     if footer:
         parts.append(footer)
-    return "\n".join(parts) if parts else SEEN
+    return "\n".join(parts)
 
 
-def render_transcript(path, footer=None):
-    """Mirror the current turn of a transcript into an ack-message body. Header-only if
-    the transcript is missing or unreadable — progress is best-effort, never fatal."""
+def lines_from_path(path):
+    """All progress lines for the transcript's current turn; [] if unreadable —
+    progress is best-effort and must never crash a turn."""
     try:
         turn = t.current_turn(t.load_rows(path)) if path else []
     except (OSError, ValueError):
-        turn = []
-    return render(turn_lines(turn), footer)
+        return []
+    return turn_lines(turn)
 
 
 def read_event(event_name=None):

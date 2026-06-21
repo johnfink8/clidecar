@@ -104,15 +104,18 @@ def lines_from_path(path):
 
 def read_event(event_name=None):
     """Parse the hook's stdin JSON; {} if unparseable so a hook never crashes a turn.
-    When event_name is set, raw stdin is logged first (diagnostic, kept during the
-    bridge proving phase)."""
+    When event_name is set, raw stdin is logged (diagnostic, kept during the bridge
+    proving phase) under the payload's real hook_event_name — so a script shared across
+    events, like the progress renderer on both PostToolUse and MessageDisplay, logs each
+    under its true name rather than a hard-coded label."""
     raw = sys.stdin.read()
-    if event_name is not None:
-        log_event(event_name, {"stdin": raw})
     try:
-        return json.loads(raw or "{}")
+        parsed = json.loads(raw or "{}")
     except json.JSONDecodeError:
-        return {}
+        parsed = {}
+    if event_name is not None:
+        log_event(parsed.get("hook_event_name") or event_name, {"stdin": raw})
+    return parsed
 
 
 def log_event(event_name, fields):

@@ -30,6 +30,16 @@
           }
         ]
       }
+    ],
+    "MessageDisplay": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/john/clidecar/plugins/discord-bridge/hook-progress.py"
+          }
+        ]
+      }
     ]
   }
 }

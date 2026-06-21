@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""PostToolUse hook — maintain the turn's live status message.
+"""PostToolUse + MessageDisplay hook — maintain the turn's live status message.
 
-Opened lazily by the first real content (narration or a non-Discord tool), so an
-empty turn posts nothing — the 👀 reaction is the only acknowledgement. Re-homes
-(freezes the current message and starts a fresh one) when a newer message has landed
-below it — John writing mid-turn — carrying only the lines since the freeze so the new
-message never duplicates the old one.
+Re-renders the status message from the transcript on every trigger. PostToolUse catches
+tool calls; MessageDisplay catches narration as it's displayed, so a narration surfaces
+immediately instead of only when the next tool runs. Opened lazily by the first real
+content (narration or a non-Discord tool), so an empty turn posts nothing — the 👀
+reaction is the only acknowledgement. Re-homes (freezes the current message and starts a
+fresh one) when a newer message has landed below it — John writing mid-turn — carrying
+only the lines since the freeze so the new message never duplicates the old one.
 """
 import sys
 
@@ -34,13 +36,15 @@ def main():
 
     body = h.render(lines)
     if mid:
+        if body == state.get("last_body"):
+            return  # unchanged — MessageDisplay can fire repeatedly mid-block; skip the redundant edit
         h.discord_edit(mid, body)
     else:
         mid = h.discord_send(body)
         if not mid:
             return
         state["message_id"] = mid
-    state.update(base=base, shown=len(full))
+    state.update(base=base, shown=len(full), last_body=body)
     h.save_turn(sid, state)
 
 

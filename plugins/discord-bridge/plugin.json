@@ -8,6 +8,9 @@
     "PostToolUse": [
       { "matcher": "*", "hooks": [{ "type": "command", "command": "${PLUGIN_DIR}/hook-progress.py" }] }
     ],
+    "MessageDisplay": [
+      { "hooks": [{ "type": "command", "command": "${PLUGIN_DIR}/hook-progress.py" }] }
+    ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "${PLUGIN_DIR}/hook-final.py" }] }
     ]

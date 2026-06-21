@@ -27,17 +27,19 @@ import socket
 import threading
 import time
 from dataclasses import asdict, dataclass
-from typing import Callable
+from typing import IO, Callable
 
 import transcript as t
 
 SOCK_PATH = os.path.expanduser("~/.clidecar/control/gateway.sock")
 OP_RETRIES = 2       # the gateway retries a transient adapter failure so hooks never see a flaky transport
 OP_BACKOFF_S = 0.5
+NO_CLAUDE_REACT = "❌"  # honest non-delivery: react when no Claude is attached, leaving control with the user
 
 Clock = Callable[[], float]
 Transport = Callable[..., tuple[int, str]]       # the adapter shell-out: (verb, *args) -> (returncode, stdout)
-Deliver = Callable[["Inbound"], None]            # hand a message to Claude as a <channel> prompt
+OnRequest = Callable[["dict[str, object]"], "dict[str, object] | None"]  # one MCP request -> its JSON-RPC response (None = notification)
+Notify = Callable[["Inbound"], "dict[str, object]"]                      # build the notifications/claude/channel frame for an inbound
 
 
 @dataclass(frozen=True)
@@ -111,18 +113,28 @@ def _recv_line(conn: socket.socket) -> dict[str, object] | None:
 # --------------------------------------------------------------------------- gateway side
 
 class Broker:
-    """The gateway's transport mediator: a Unix-socket server + an in-memory claim registry. The
-    gateway constructs ONE Broker with its transport `send` and its `deliver`-to-Claude, calls
+    """The gateway's transport mediator: a Unix-socket server + an in-memory claim registry + the
+    attach point for Claude. The gateway constructs ONE Broker with its `transport`, its
+    `on_request` (answer one MCP request) and `notify` (build an inbound's channel frame), calls
     serve() once (spawns the accept + reap threads), and calls route_inbound() for every message it
-    receives from the transport."""
+    receives from the transport.
 
-    def __init__(self, transport: Transport, deliver: Deliver, clock: Clock = time.time) -> None:
+    Claude attaches over the same socket as a `channel`-role client (via the disposable stdio shim):
+    the Broker pushes unclaimed inbound to it as notify() frames and answers its MCP requests through
+    on_request. There is at most one attached Claude — the newest attach wins."""
+
+    def __init__(self, transport: Transport, on_request: OnRequest, notify: Notify,
+                 clock: Clock = time.time) -> None:
         self._transport = transport          # the ONLY caller of the adapter — strict lanes
-        self._deliver = deliver
+        self._on_request = on_request
+        self._notify = notify
         self._clock = clock
         self._claims: list[_Claim] = []       # open waits, newest-first (a stack)
         self._emitted: set[tuple[str, str]] = set()
         self._lock = threading.Lock()
+        self._channel: socket.socket | None = None  # the attached Claude (newest shim wins); None = nobody home
+        self._chan_lock = threading.Lock()          # guards the _channel reference
+        self._chan_write_lock = threading.Lock()    # serializes pushed notifications vs request responses on the one socket
 
     def _op(self, *args: str) -> tuple[int, str]:
         """Call the adapter, retrying a transient failure — the gateway is the ONE place transport
@@ -135,22 +147,27 @@ class Broker:
             code, out = self._transport(*args)
         return code, out
 
-    def emit(self, out: Outbound) -> bool:
-        """Emit ONE outbound message to the transport, exactly once. Dedup on (kind, dedup_key). The
+    def emit(self, out: Outbound) -> str | None:
+        """Emit ONE outbound message to the transport, exactly once, and RETURN its new message id —
+        the status-message workflow needs the id to edit/cap it later. Dedup on (kind, dedup_key): the
         key is CLAIMED before the send and RELEASED on failure (claim/commit/release) — so a concurrent
         duplicate can't race in, yet a failed send doesn't permanently suppress a retry of the same
-        logical message. The single outbound funnel for every producer."""
+        logical message. Returns the new message id on success, or None if the send was deduped
+        (dedup_key already emitted) or the transport failed. The single outbound funnel for every
+        producer; with dedup_key=None it always sends (today's status/closing behaviour)."""
         key = (out.kind, out.dedup_key) if out.dedup_key is not None else None
         if key is not None:
             with self._lock:
                 if key in self._emitted:
-                    return False
+                    return None
                 self._emitted.add(key)
-        code, _ = self._op("send", out.text, *([out.reply_to] if out.reply_to else []))
-        if code != 0 and key is not None:
-            with self._lock:
-                self._emitted.discard(key)  # release so a retry can re-emit — never silently drop
-        return code == 0
+        code, mid = self._op("send", out.text, *([out.reply_to] if out.reply_to else []))
+        if code != 0:
+            if key is not None:
+                with self._lock:
+                    self._emitted.discard(key)  # release so a retry can re-emit — never silently drop
+            return None
+        return mid.strip() or None
 
     def edit(self, message_id: str, text: str) -> bool:
         return self._op("edit", message_id, text)[0] == 0
@@ -164,7 +181,8 @@ class Broker:
 
     def route_inbound(self, msg: Inbound) -> str:
         """Route ONE inbound message to exactly one sink. Returns "exchange:<label>" if an open claim
-        consumed it (NOT delivered to Claude), or "claude" if delivered as a prompt. Total and
+        consumed it, "claude" if pushed to the attached Claude, or "undelivered" if nobody is attached
+        (the Broker reacts ❌ — honest non-delivery, control stays with the user). Total and
         deterministic — the user's reply is never double-handled."""
         with self._lock:
             for claim in list(self._claims):
@@ -175,8 +193,19 @@ class Broker:
                     finally:
                         claim.conn.close()
                     return f"exchange:{claim.label}"
-        self._deliver(msg)
-        return "claude"
+        with self._chan_lock:
+            chan = self._channel
+        if chan is not None:
+            try:
+                with self._chan_write_lock:
+                    _send_line(chan, self._notify(msg))
+                return "claude"
+            except OSError:
+                with self._chan_lock:
+                    if self._channel is chan:
+                        self._channel = None  # dead attach — drop it and fall through to ❌
+        self._op("react", msg.id, NO_CLAUDE_REACT)
+        return "undelivered"
 
     def serve(self, sock_path: str = SOCK_PATH) -> None:
         try:
@@ -196,9 +225,24 @@ class Broker:
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
     def _handle(self, conn: socket.socket) -> None:
-        req = _recv_line(conn)
-        if req is None:
+        try:
+            reader = conn.makefile("r")
+            first = reader.readline()
+        except OSError:
             conn.close()
+            return
+        if not first:
+            conn.close()
+            return
+        try:
+            req = t.as_obj(json.loads(first))
+        except json.JSONDecodeError:
+            conn.close()
+            return
+        if req.get("role") == "channel":
+            # Claude attaching as the channel — the same buffered reader carries its MCP stream, so
+            # no byte is lost between this handshake line and the frames that follow.
+            self._serve_channel(conn, reader)
             return
         op = req.get("op")
         if op == "ask":
@@ -215,12 +259,12 @@ class Broker:
             with self._lock:
                 self._claims.insert(0, claim)
         elif op == "emit":
-            sent = self.emit(Outbound(
+            mid = self.emit(Outbound(
                 text=str(req.get("text", "")), kind=str(req.get("kind", "notice")),
                 source=str(req.get("source", "gateway")),
                 dedup_key=_opt_str(req, "dedup_key"), reply_to=_opt_str(req, "reply_to"),
             ))
-            _send_line(conn, {"sent": sent})
+            _send_line(conn, {"id": mid})
             conn.close()
         elif op == "edit":
             ok = self.edit(str(req.get("message_id", "")), str(req.get("text", "")))
@@ -235,6 +279,35 @@ class Broker:
             _send_line(conn, {"id": self.latest()})
             conn.close()
         else:
+            conn.close()
+
+    def _serve_channel(self, conn: socket.socket, reader: "IO[str]") -> None:
+        """Serve an attached Claude over `conn`: it becomes the sink for unclaimed inbound (pushed by
+        route_inbound as notify() frames) and the source of MCP requests (answered via on_request).
+        Newest attach wins — a fresh shim supersedes a stale one. The write lock serializes our pushed
+        notifications against these request responses on the one socket; on disconnect we clear the
+        channel only if we are still the current one (a newer attach must not be evicted)."""
+        with self._chan_lock:
+            self._channel = conn
+        try:
+            for line in reader:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                resp = self._on_request(t.as_obj(parsed))
+                if resp is not None:
+                    with self._chan_write_lock:
+                        _send_line(conn, resp)
+        except OSError:
+            pass
+        finally:
+            with self._chan_lock:
+                if self._channel is conn:
+                    self._channel = None
             conn.close()
 
     def _reap(self) -> None:
@@ -293,11 +366,15 @@ def _request(payload: dict[str, object], sock_path: str, timeout: float = 10) ->
         return None
 
 
-def emit(out: Outbound, *, sock_path: str = SOCK_PATH) -> bool:
-    """Ask the gateway to emit one outbound message, deduped. True if sent, False if deduped or the
-    gateway is unreachable. Every hook send goes through here — the adapter is the gateway's alone."""
+def emit(out: Outbound, *, sock_path: str = SOCK_PATH) -> str | None:
+    """Ask the gateway to emit one outbound message, deduped, and return its new message id — or None
+    if the send was deduped or the gateway is unreachable. Every hook send goes through here: the
+    adapter is the gateway's alone (strict lanes), so a None means fail-loud, never an adapter retry."""
     resp = _request({"op": "emit", **asdict(out)}, sock_path)
-    return bool(resp is not None and resp.get("sent"))
+    if resp is None:
+        return None
+    mid = resp.get("id")
+    return mid if isinstance(mid, str) else None
 
 
 def edit(message_id: str, text: str, *, sock_path: str = SOCK_PATH) -> bool:

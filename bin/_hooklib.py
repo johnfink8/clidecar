@@ -22,8 +22,8 @@ DISCORD_MSG = os.path.join(BIN, "discord-msg.sh")
 
 SEEN = "👀"
 DONE = "✅"
-MAX_LINES = 18
-LINE_CAP = 110
+BODY_CAP = 1900  # headroom under Discord's 2000-char message limit
+TOOL_CAP = 120   # tool summaries stay one tidy line; narrations are never capped
 
 
 def summarize_tool(tool_name, tool_input):
@@ -44,29 +44,40 @@ def summarize_tool(tool_name, tool_input):
 
 
 def turn_lines(turn):
-    """Each assistant text block collapses to its first line — a progress ticker, not a
-    transcript dump (the full closing answer is the separate Stop message); each tool_use
-    becomes one summarized line. Discord replies are skipped — they're their own visible
-    messages, not work worth a status line."""
-    lines = []
+    """Ordered (kind, text) items for the turn: ("text", full narration) and
+    ("tool", summary). Narrations are kept WHOLE — they carry intent and reasoning, so
+    they're never truncated; only tool summaries are length-capped (at render). Discord
+    replies are skipped — they're their own visible messages, not work worth a line."""
+    items = []
     for o in turn:
         for b in t.assistant_blocks(o) or []:
             if not isinstance(b, dict):
                 continue
             if b.get("type") == "text":
-                head = next((ln.strip() for ln in b.get("text", "").splitlines() if ln.strip()), "")
-                if head:
-                    lines.append(f"💬 {head}")
+                txt = b.get("text", "").strip()
+                if txt:
+                    items.append(("text", txt))
             elif b.get("type") == "tool_use" and not t.is_discord_reply(b.get("name")):
-                lines.append(summarize_tool(b.get("name", ""), b.get("input")))
-    return lines
+                items.append(("tool", summarize_tool(b.get("name", ""), b.get("input"))))
+    return items
 
 
-def render(lines, footer=None):
-    parts = [f"`{ln[:LINE_CAP]}`" for ln in lines[-MAX_LINES:]]
+def render(items, footer=None):
+    """Newest-first fit of items into one Discord message: narrations whole, tool
+    summaries one-line-capped. Oldest WHOLE items roll off only if the block would
+    exceed Discord's size limit — a narration is never cut mid-text (a lone narration
+    over the cap is the only exception, hard-sliced as a last resort)."""
+    lines = [text if kind == "text" else f"`{text[:TOOL_CAP]}`" for kind, text in items]
     if footer:
-        parts.append(footer)
-    return "\n".join(parts)
+        lines.append(footer)
+    kept, total = [], 0
+    for line in reversed(lines):
+        if kept and total + len(line) + 1 > BODY_CAP:
+            break
+        kept.append(line)
+        total += len(line) + 1
+    kept.reverse()
+    return "\n".join(kept)[:1990]
 
 
 def lines_from_path(path):

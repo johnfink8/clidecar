@@ -3,6 +3,7 @@ capabilities — so the Claude-aware hooks stay provider-agnostic. A channel is 
 plugins/<name>/ with a plugin.json manifest {kind:"messaging", transport, capabilities}. The
 active channel is config.env CHANNEL, else the sole installed messaging plugin.
 """
+
 import json
 import os
 import sys
@@ -95,11 +96,17 @@ def active() -> tuple[str | None, str | None]:
     if configured:
         if configured in msgs:
             return configured, None
-        return None, f"CHANNEL={configured!r} is not an installed messaging plugin (installed: {msgs or 'none'})"
+        return (
+            None,
+            f"CHANNEL={configured!r} is not an installed messaging plugin (installed: {msgs or 'none'})",
+        )
     if not msgs:
         return None, "no messaging plugin installed under plugins/"
     if len(msgs) > 1:
-        return None, f"ambiguous: messaging plugins {msgs} installed; set CHANNEL in config.env to pick one"
+        return (
+            None,
+            f"ambiguous: messaging plugins {msgs} installed; set CHANNEL in config.env to pick one",
+        )
     return msgs[0], None
 
 

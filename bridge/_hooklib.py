@@ -8,21 +8,22 @@ Every JSON boundary (hook stdin, the per-turn state file) is validated, not asse
 each dataclass's from_obj classmethod constructs it from isinstance-checked fields, so a
 wrong-typed value is dropped rather than trusted.
 """
+
 import contextlib
 import datetime
 import fcntl
 import json
 import os
 import sys
+from collections.abc import Callable, Generator
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Generator
 
 BIN = os.path.dirname(os.path.abspath(__file__))
 if BIN not in sys.path:
     sys.path.insert(0, BIN)
-import channel
-import exchange as ex
-import transcript as t
+import channel  # noqa: E402  (sibling import after the sys.path insert above)
+import exchange as ex  # noqa: E402
+import transcript as t  # noqa: E402
 
 STATE_DIR = os.path.expanduser("~/.clidecar/state")
 LOG_DIR = os.path.join(STATE_DIR, "hooklog")
@@ -32,11 +33,13 @@ SEEN = "👀"
 DONE = "✅"
 WORKING = "⏳"
 BODY_CAP = 1900  # headroom under Discord's 2000-char message limit
-TOOL_CAP = 120   # tool summaries stay one tidy line; narrations are never capped
+TOOL_CAP = 120  # tool summaries stay one tidy line; narrations are never capped
 
 WORKING_FOOTER = f"{WORKING} *working…*"
 DONE_FOOTER = f"{DONE} *done*"
-DONE_PING = DONE_FOOTER  # the tiny end-of-turn message whose only job is a completion push; mirrors the cap
+DONE_PING = (
+    DONE_FOOTER  # the tiny end-of-turn message whose only job is a completion push; mirrors the cap
+)
 # A sealed (spilled) message's footer. Kept to ONE char so sealing can never have to drop a
 # line the message already showed: a frozen prefix carrying this footer fits at least as many
 # lines as the live block did with the longer working footer. The fresh message below it is
@@ -60,6 +63,7 @@ def _int_field(d: dict[str, object], key: str) -> int:
 @dataclass(frozen=True)
 class HookEvent:
     """The hook's stdin JSON — fields vary by event, hence all optional."""
+
     session_id: str | None = None
     transcript_path: str | None = None
     prompt: str | None = None
@@ -304,9 +308,11 @@ def render_head(items: list[Item], footer: str | None = None, open_lang: str | N
 def make_persist(session_id: str | None, state: TurnState) -> Callable[[int, str | None], None]:
     """spill()'s checkpoint: record base+message_id after each seal so a later failure can't
     re-seal (duplicate) or strand. Lives next to spill() so both hooks share the one contract."""
+
     def persist(base: int, mid: str | None) -> None:
         state.base, state.message_id = base, mid
         save_turn(session_id, state)
+
     return persist
 
 
@@ -328,7 +334,9 @@ def spill(
     can't re-seal (duplicate) or strand. Returns the new (base, mid); units[base:] then fits, unless
     a lone over-cap unit remains (render hard-slices it, the documented last resort)."""
     show = units + live_units
-    sealable = show[:-1]  # the LAST shown unit is the live tail (a still-streaming line) — never seal it
+    sealable = show[
+        :-1
+    ]  # the LAST shown unit is the live tail (a still-streaming line) — never seal it
     while not fits(show[base:], footer):
         head = sealable[base:]
         if not head:
@@ -383,7 +391,7 @@ def log_event(event_name: str, fields: dict[str, object]) -> None:
     """Append a diagnostic record to hooklog/events.jsonl (best-effort, never fatal)."""
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
-        ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        ts = datetime.datetime.now(datetime.UTC).isoformat()
         record = {"ts": ts, "event": event_name, **fields}
         with open(os.path.join(LOG_DIR, "events.jsonl"), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
@@ -399,7 +407,7 @@ def persist_undelivered(session_id: str | None, text: str) -> str | None:
     """
     try:
         os.makedirs(UNDELIVERED_DIR, exist_ok=True)
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
         path = os.path.join(UNDELIVERED_DIR, f"{ts}-{session_id or 'default'}.txt")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -466,7 +474,9 @@ def channel_send(text: str, reply_to: str | None = None) -> str | None:
     mid = ex.emit(ex.Outbound(text=text, kind="message", source="claude", reply_to=reply_to))
     if mid is None:
         log_event("gateway_send_failed", {"chars": len(text)})
-        sys.stderr.write("clidecar bridge: gateway unreachable on send (strict lanes — no adapter fallback)\n")
+        sys.stderr.write(
+            "clidecar bridge: gateway unreachable on send (strict lanes — no adapter fallback)\n"
+        )
     return mid
 
 

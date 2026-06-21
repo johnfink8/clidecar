@@ -25,6 +25,9 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+# `ruff format` owns line length for code; E501 then only nags about unsplittable
+# string literals, so defer line length entirely to the formatter.
+ignore = ["E501"]
 
 # Consolidated from the former pyrightconfig.json — single source of config.
 [tool.pyright]

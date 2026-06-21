@@ -21,25 +21,35 @@ code, not Claude's turn loop — post a prompt, block for the user's next reply,
 not in the loop and never sees the reply, so it can't double-handle it. Pending AskUserQuestion is
 the first instance; "dump this file, wait for confirm" is another.
 """
+
 import json
 import os
 import socket
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import IO, Callable, Literal
+from typing import IO, Literal
 
 import transcript as t
 
 SOCK_PATH = os.path.expanduser("~/.clidecar/control/gateway.sock")
-OP_RETRIES = 2       # the gateway retries a transient adapter failure so hooks never see a flaky transport
+OP_RETRIES = (
+    2  # the gateway retries a transient adapter failure so hooks never see a flaky transport
+)
 OP_BACKOFF_S = 0.5
-NO_CLAUDE_REACT = "❌"  # honest non-delivery: react when no Claude is attached, leaving control with the user
+NO_CLAUDE_REACT = (
+    "❌"  # honest non-delivery: react when no Claude is attached, leaving control with the user
+)
 
-Kind = Literal["message", "question", "notice"]  # the outbound kinds; half of the (kind, dedup_key) idempotency token
+Kind = Literal[
+    "message", "question", "notice"
+]  # the outbound kinds; half of the (kind, dedup_key) idempotency token
 
 Clock = Callable[[], float]
-Transport = Callable[..., tuple[int, str]]       # the adapter shell-out: (verb, *args) -> (returncode, stdout)
+Transport = Callable[
+    ..., tuple[int, str]
+]  # the adapter shell-out: (verb, *args) -> (returncode, stdout)
 OnRequest = Callable[["dict[str, object]"], "dict[str, object] | None"]
 Notify = Callable[["Inbound"], "dict[str, object]"]
 
@@ -48,6 +58,7 @@ Notify = Callable[["Inbound"], "dict[str, object]"]
 class Inbound:
     """A message from the user. `id` is the transport's monotonic message id (a Discord snowflake);
     routing orders on it, not the wall-clock ts."""
+
     id: str
     chat_id: str
     user: str
@@ -69,9 +80,10 @@ class Outbound:
     """A message to the user. `kind`+`dedup_key` is the idempotency token: the same logical message
     emitted twice (Claude's closing hook vs. a gateway echo of it) is sent once. dedup_key=None opts
     out — for genuinely distinct messages like the streamed status frames."""
+
     text: str
     kind: Kind
-    source: str                    # "claude" | "gateway" | "tool"
+    source: str  # "claude" | "gateway" | "tool"
     dedup_key: str | None = None
     reply_to: str | None = None
 
@@ -80,6 +92,7 @@ class Outbound:
 class _Claim:
     """The inbound half of an open Exchange, held in the gateway's memory. `conn` is the live client
     socket the reply is written back on; closing it ends the claim."""
+
     chat_id: str
     since_id: str
     conn: socket.socket
@@ -114,6 +127,7 @@ def _recv_line(conn: socket.socket) -> dict[str, object] | None:
 
 # --------------------------------------------------------------------------- gateway side
 
+
 class Broker:
     """The gateway's transport mediator: a Unix-socket server + an in-memory claim registry + the
     attach point for Claude. The gateway constructs ONE Broker with its `transport`, its
@@ -125,18 +139,23 @@ class Broker:
     the Broker pushes unclaimed inbound to it as notify() frames and answers its MCP requests through
     on_request. There is at most one attached Claude — the newest attach wins."""
 
-    def __init__(self, transport: Transport, on_request: OnRequest, notify: Notify,
-                 clock: Clock = time.time) -> None:
-        self._transport = transport          # the ONLY caller of the adapter — strict lanes
+    def __init__(
+        self, transport: Transport, on_request: OnRequest, notify: Notify, clock: Clock = time.time
+    ) -> None:
+        self._transport = transport  # the ONLY caller of the adapter — strict lanes
         self._on_request = on_request
         self._notify = notify
         self._clock = clock
-        self._claims: list[_Claim] = []       # open waits, newest-first (a stack)
+        self._claims: list[_Claim] = []  # open waits, newest-first (a stack)
         self._emitted: set[tuple[str, str]] = set()
         self._lock = threading.Lock()
-        self._channel: socket.socket | None = None  # the attached Claude (newest shim wins); None = nobody home
-        self._chan_lock = threading.Lock()          # guards the _channel reference
-        self._chan_write_lock = threading.Lock()    # serializes pushed notifications vs request responses on the one socket
+        self._channel: socket.socket | None = (
+            None  # the attached Claude (newest shim wins); None = nobody home
+        )
+        self._chan_lock = threading.Lock()  # guards the _channel reference
+        self._chan_write_lock = (
+            threading.Lock()
+        )  # serializes pushed notifications vs request responses on the one socket
 
     def _op(self, *args: str) -> tuple[int, str]:
         """Call the adapter, retrying a transient failure — the gateway is the ONE place transport
@@ -167,7 +186,9 @@ class Broker:
         if code != 0:
             if key is not None:
                 with self._lock:
-                    self._emitted.discard(key)  # release so a retry can re-emit — never silently drop
+                    self._emitted.discard(
+                        key
+                    )  # release so a retry can re-emit — never silently drop
             return None
         return mid.strip() or None
 
@@ -253,8 +274,10 @@ class Broker:
             # Register the claim and LEAVE conn open — route_inbound (or the reaper) writes the
             # reply and closes it. The connection is the claim's liveness signal.
             claim = _Claim(
-                chat_id=str(req.get("chat_id", "")), since_id=str(req.get("since_id", "")),
-                conn=conn, expires_at=self._clock() + float(_num(req, "timeout", 600)),
+                chat_id=str(req.get("chat_id", "")),
+                since_id=str(req.get("since_id", "")),
+                conn=conn,
+                expires_at=self._clock() + float(_num(req, "timeout", 600)),
                 label=str(req.get("label", "")),
             )
             prompt = req.get("prompt")
@@ -263,11 +286,15 @@ class Broker:
             with self._lock:
                 self._claims.insert(0, claim)
         elif op == "emit":
-            mid = self.emit(Outbound(
-                text=str(req.get("text", "")), kind=as_kind(req.get("kind")),
-                source=str(req.get("source", "gateway")),
-                dedup_key=_opt_str(req, "dedup_key"), reply_to=_opt_str(req, "reply_to"),
-            ))
+            mid = self.emit(
+                Outbound(
+                    text=str(req.get("text", "")),
+                    kind=as_kind(req.get("kind")),
+                    source=str(req.get("source", "gateway")),
+                    dedup_key=_opt_str(req, "dedup_key"),
+                    reply_to=_opt_str(req, "reply_to"),
+                )
+            )
             _send_line(conn, {"id": mid})
             conn.close()
         elif op == "edit":
@@ -275,8 +302,11 @@ class Broker:
             _send_line(conn, {"ok": ok})
             conn.close()
         elif op == "react":
-            ok = self.react(str(req.get("message_id", "")), str(req.get("emoji", "")),
-                            bool(req.get("add", True)))
+            ok = self.react(
+                str(req.get("message_id", "")),
+                str(req.get("emoji", "")),
+                bool(req.get("add", True)),
+            )
             _send_line(conn, {"ok": ok})
             conn.close()
         elif op == "latest":
@@ -333,8 +363,16 @@ class Broker:
 
 # --------------------------------------------------------------------------- client side (hook/skill)
 
-def ask(chat_id: str, prompt: str | None, *, since_id: str, timeout: float, label: str,
-        sock_path: str = SOCK_PATH) -> Inbound | None:
+
+def ask(
+    chat_id: str,
+    prompt: str | None,
+    *,
+    since_id: str,
+    timeout: float,
+    label: str,
+    sock_path: str = SOCK_PATH,
+) -> Inbound | None:
     """Open an Exchange and BLOCK for the user's reply — the "ask and wait" entry point for a hook or
     skill. Connects to the gateway, hands it the prompt + claim, and blocks on the socket until the
     gateway pushes the reply (or the claim lapses). Returns the Inbound reply, or None if the gateway
@@ -344,8 +382,17 @@ def ask(chat_id: str, prompt: str | None, *, since_id: str, timeout: float, labe
         conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         conn.settimeout(timeout + 5)
         conn.connect(sock_path)
-        _send_line(conn, {"op": "ask", "chat_id": chat_id, "prompt": prompt,
-                          "since_id": since_id, "timeout": timeout, "label": label})
+        _send_line(
+            conn,
+            {
+                "op": "ask",
+                "chat_id": chat_id,
+                "prompt": prompt,
+                "since_id": since_id,
+                "timeout": timeout,
+                "label": label,
+            },
+        )
         resp = _recv_line(conn)
         conn.close()
     except OSError:
@@ -355,7 +402,9 @@ def ask(chat_id: str, prompt: str | None, *, since_id: str, timeout: float, labe
     return Inbound.from_obj(resp.get("reply"))  # absent ("lapsed") → from_obj(None) → None
 
 
-def _request(payload: dict[str, object], sock_path: str, timeout: float = 10) -> dict[str, object] | None:
+def _request(
+    payload: dict[str, object], sock_path: str, timeout: float = 10
+) -> dict[str, object] | None:
     """One request→response round-trip to the gateway socket; None if the gateway is unreachable
     (the caller fails loud — never reaches around to the adapter)."""
     try:
@@ -387,7 +436,9 @@ def edit(message_id: str, text: str, *, sock_path: str = SOCK_PATH) -> bool:
 
 
 def react(message_id: str, emoji: str, add: bool = True, *, sock_path: str = SOCK_PATH) -> bool:
-    resp = _request({"op": "react", "message_id": message_id, "emoji": emoji, "add": add}, sock_path)
+    resp = _request(
+        {"op": "react", "message_id": message_id, "emoji": emoji, "add": add}, sock_path
+    )
     return bool(resp is not None and resp.get("ok"))
 
 

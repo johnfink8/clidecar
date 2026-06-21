@@ -12,6 +12,7 @@ client (ask/emit) on the same socket. If the daemon isn't up yet (the supervisor
 Claude, but races happen) the shim retries briefly, then exits — CC sees the channel fail loudly
 rather than the shim hanging.
 """
+
 import socket
 import sys
 import threading
@@ -40,7 +41,9 @@ def main() -> int:
     if conn is None:
         sys.stderr.write(f"clidecar gateway-shim: daemon socket {SOCK_PATH} unreachable\n")
         return 1
-    conn.sendall(b'{"role":"channel"}\n')  # role handshake: this is the MCP channel, not a broker client
+    conn.sendall(
+        b'{"role":"channel"}\n'
+    )  # role handshake: this is the MCP channel, not a broker client
 
     def daemon_to_cc() -> None:
         with conn.makefile("r", encoding="utf-8") as fh:

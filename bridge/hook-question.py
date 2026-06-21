@@ -9,6 +9,7 @@ the SAME turn. If the wait lapses or the gateway is unreachable, it degrades to 
 (deny, await the user's next message). Fail-loud: if the channel post can't land, the deny reason
 tells the model to ask in plain prose itself, so the question always reaches the user either way.
 """
+
 import json
 import sys
 
@@ -59,8 +60,11 @@ def format_question(q: dict[str, object]) -> str:
             line += f" — {desc}"
         lines.append(line)
     multi = bool(q.get("multiSelect"))
-    lines.append("_Reply with the numbers or labels (pick one or more)._" if multi
-                 else "_Reply with a number or the option label._")
+    lines.append(
+        "_Reply with the numbers or labels (pick one or more)._"
+        if multi
+        else "_Reply with a number or the option label._"
+    )
     return "\n".join(lines)
 
 
@@ -93,14 +97,27 @@ def main() -> None:
         reason, outcome = POSTED_REASON, "posted"
     else:
         reason, outcome = PROSE_REASON, "prose_fallback"
-    h.log_event("PreToolUse", {"tool": "AskUserQuestion", "questions": len(questions),
-                               "posted": posted, "outcome": outcome})
+    h.log_event(
+        "PreToolUse",
+        {
+            "tool": "AskUserQuestion",
+            "questions": len(questions),
+            "posted": posted,
+            "outcome": outcome,
+        },
+    )
 
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": reason,
-    }}))
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }
+        )
+    )
 
 
 if __name__ == "__main__":

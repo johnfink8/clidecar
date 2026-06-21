@@ -14,6 +14,7 @@ shown tail no longer fits one message it freezes on a line boundary and continue
 one, so a long answer — streamed or committed — lays itself out across messages and nothing
 already shown is ever removed. The Stop hook just caps the last message.
 """
+
 import sys
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
@@ -50,14 +51,19 @@ def main() -> None:
         if mid and not is_md and h.can("latest"):
             latest = h.channel_latest()  # re-home on tool boundaries, not per narration segment
             if latest and latest != mid:
-                base, mid = min(state.shown, len(full)), None  # freeze old message; new one starts here
+                base, mid = (
+                    min(state.shown, len(full)),
+                    None,
+                )  # freeze old message; new one starts here
 
         # The live narration's last line is still being typed; spill holds it unsealable so a seal
         # always lands on a completed line. Spill runs on streaming too (is_md) — that's what makes
         # a long pure-output answer lay itself out append-only instead of overflowing one message.
         live_units = h.split_units([("text", live)]) if live else []
 
-        base, mid = h.spill(full, base, mid, live_units, h.WORKING_FOOTER, h.make_persist(sid, state))
+        base, mid = h.spill(
+            full, base, mid, live_units, h.WORKING_FOOTER, h.make_persist(sid, state)
+        )
 
         combined = full + live_units
         tail = combined[base:]

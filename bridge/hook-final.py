@@ -10,6 +10,7 @@ marked ✅ when the answer actually landed.
 The Stop hook can fire before the closing message is flushed to the transcript, so we
 bounded-poll for it; on timeout we fail loud rather than forward the stale intermediate.
 """
+
 import os
 import sys
 import time
@@ -81,7 +82,9 @@ def lay_out(sid: str | None, state: h.TurnState, units: list[h.Item]) -> bool:
     (the closing may have committed after the last progress render). Returns whether the full answer
     is now shown across the messages; False (a single over-cap line, or a failed cap) tells the
     caller to guarantee it via deliver()."""
-    base, mid = h.spill(units, state.base, state.message_id, [], h.DONE_FOOTER, h.make_persist(sid, state))
+    base, mid = h.spill(
+        units, state.base, state.message_id, [], h.DONE_FOOTER, h.make_persist(sid, state)
+    )
     state.base, state.message_id = base, mid
     tail = units[base:]
     if not h.fits(tail, footer=h.DONE_FOOTER):
@@ -89,7 +92,9 @@ def lay_out(sid: str | None, state: h.TurnState, units: list[h.Item]) -> bool:
     body = h.render(tail, open_lang=h.fence_state(units[:base]))
     if mid:
         return h.channel_edit(mid, body)
-    mid = h.channel_send(body)  # spill nulled mid sealing the prior chunk: this fresh cap continues it
+    mid = h.channel_send(
+        body
+    )  # spill nulled mid sealing the prior chunk: this fresh cap continues it
     state.message_id = mid
     return bool(mid)
 
@@ -97,7 +102,7 @@ def lay_out(sid: str | None, state: h.TurnState, units: list[h.Item]) -> bool:
 def decorate_source(state: h.TurnState) -> None:
     src = state.source_message_id
     if src and h.can("react"):
-        h.channel_react(src, h.DONE)             # add ✅ first so the reaction row never empties
+        h.channel_react(src, h.DONE)  # add ✅ first so the reaction row never empties
         h.channel_react(src, h.SEEN, add=False)  # then drop 👀 — avoids a vertical-size flicker
 
 
@@ -152,11 +157,15 @@ def main() -> None:
         else:
             if not covered and not deliver(sid, text):  # over-cap line / failed cap — guarantee it
                 return
-            h.log_event("Stop", {"outcome": "append_only" if covered else "delivered", "chars": len(text)})
+            h.log_event(
+                "Stop", {"outcome": "append_only" if covered else "delivered", "chars": len(text)}
+            )
 
         decorate_source(state)
         if not already_sent:
-            h.channel_send(h.DONE_PING)  # John's pick: one tiny ✅ message — the sole done marker + push
+            h.channel_send(
+                h.DONE_PING
+            )  # John's pick: one tiny ✅ message — the sole done marker + push
 
         if tid is not None:
             state.done = tid

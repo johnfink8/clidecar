@@ -6,6 +6,7 @@ to a JSON object/array (a sound cast — JSON object keys are always strings, va
 arbitrary), and each field is `isinstance`-checked at the point of use. So the typing
 reflects real runtime validation, not an unchecked assertion about the shape.
 """
+
 import json
 import sys
 from typing import cast

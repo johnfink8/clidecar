@@ -6,6 +6,7 @@ keeps a standalone, scriptable entry point for tests and manual inspection. Exit
 non-zero (loud) if the transcript can't be parsed — a silent empty forward would hide
 a broken bridge.
 """
+
 import json
 import sys
 

@@ -47,8 +47,6 @@ clidecar turns a single instance into a durable one:
   (syntax-checks, copies to known-good, `systemctl --user restart`). The managed
   Claude is adopted, not disturbed (`KillMode=process`).
 
-See [SPEC.md](SPEC.md) for the full design and rationale.
-
 ## Layout
 
 Code and templates live in the repo. Everything dynamic and personal — your
@@ -64,13 +62,18 @@ data dir, `~/.clidecar`, so the repo stays clean.
     notify-discord.sh          bot-API ping (sidecar/fallback can't reach the MCP)
     fallback.sh                OnFailure: restore known-good sidecar + ping
     _pluginctl.py              enable/disable hook plugins (edits .claude/settings.json)
+  bridge/                      the output-bridge core (channel-agnostic, Claude-aware)
+    hook-{ack,progress,final}.py  the UserPromptSubmit / PostToolUse / Stop hooks
+    _hooklib.py, transcript.py    shared state + rendering, transcript parsing
+    channel.py                 resolves the active messaging adapter → transport + caps
+  plugins/
+    discord/                   a messaging-channel adapter (dumb transport, no Claude awareness)
+      plugin.json              manifest: kind / transport / capabilities
+      msg.sh                   send / edit / react / latest via the bot API
   systemd/
     clidecar.service           the supervisor unit
     clidecar-fallback.service  OnFailure one-shot
-  plugins/
-    discord-bridge/            Discord output bridge (optional hook plugin)
-      plugin.json              hooks fragment + metadata
-      hook-{ack,progress,final}.py, _hooklib.py, transcript.py, discord-msg.sh
+  pyrightconfig.json           strict type-check config for bridge/
   state/{state,queue}.md.example
 
 ~/.clidecar/                   the data dir (outside the repo)
@@ -104,9 +107,11 @@ cp ~/clidecar/state/queue.md.example ~/.clidecar/state/queue.md
 # Discord/remote-control args to CLAUDE_ARGS if you want them
 
 # 4. (optional) Discord bridge: put your bot token in
-#    ~/.claude/channels/discord/.env  as  DISCORD_BOT_TOKEN=...
-#    set DISCORD_CHANNEL_ID in ~/.clidecar/config.env, then enable the plugin:
-#    clidecar plugin enable discord-bridge   (takes effect on next recycle)
+#    ~/.claude/channels/discord/.env  as  DISCORD_BOT_TOKEN=...  and set
+#    DISCORD_CHANNEL_ID in ~/.clidecar/config.env. The bridge hooks are registered in
+#    .claude/settings.json with command paths under bridge/ — point those at your own
+#    checkout if it isn't /home/<you>/clidecar. plugins/discord is then auto-selected as
+#    the sole messaging adapter (no enable step — the bridge is core, not a toggle plugin).
 
 # 5. install the systemd --user units
 mkdir -p ~/.config/systemd/user
@@ -138,26 +143,28 @@ Three layers, deliberately separate:
   built it.
 - **state.md / queue.md** — the live now + backlog (churn every recycle).
 
-## Plugins
+## Output bridge & channels
 
-Optional hook-based add-ons live in `plugins/<name>/`, each a self-contained dir
-with a `plugin.json` (a Claude Code hooks fragment using a `${PLUGIN_DIR}`
-placeholder). Manage them from the control CLI:
+clidecar makes the chat channel a guaranteed, console-faithful output sink. The
+bridge **core** lives in `bridge/` (the only Claude-aware code, registered as hooks
+in `.claude/settings.json`): it reacts 👀 to your message, keeps a live status
+message mirroring the turn's narration and tool calls (re-homed below any messages
+you send mid-turn), and a `Stop` hook deterministically posts the turn's closing
+answer — so a reply is never lost to the console even if the model forgets to send
+it. The core is typed under pyright strict and validates every JSON boundary.
 
-```sh
-clidecar plugin list                   # what's available + on/off
-clidecar plugin enable discord-bridge  # wire its hooks into .claude/settings.json
-clidecar plugin disable discord-bridge
-clidecar recycle                       # hooks load at launch, so recycle to apply
-```
+The core is **channel-agnostic**. A messaging *channel* is a dumb adapter under
+`plugins/<name>/` that knows nothing about Claude: a `plugin.json` manifest
+declaring `kind: "messaging"`, its transport script, and its `capabilities`
+(`edit` / `react` / `latest`), plus the script itself (`send` / `edit` / `react` /
+`latest`). The bridge resolves the active adapter at runtime — `CHANNEL` in
+`config.env`, else the sole installed messaging plugin — and degrades around any
+capability the channel doesn't declare (e.g. a channel with no reactions uses the
+status message itself as the ack). `plugins/discord/` is the bundled adapter.
 
-Bundled: **discord-bridge** — makes Discord a guaranteed, console-faithful output
-sink. It reacts 👀 to your message, keeps a live status message mirroring the
-turn's narration and tool calls (re-homed below any messages you send mid-turn),
-and a `Stop` hook deterministically posts the turn's closing answer — so a reply
-is never lost to the console even if the model forgets to send it. Editing a
-plugin's scripts takes effect immediately; only enabling/disabling (which changes
-`.claude/settings.json`) needs a recycle.
+Editing a hook or transport script takes effect immediately; only changing which
+hooks are registered in `.claude/settings.json` needs a recycle. (`clidecar plugin
+list/enable/disable` manages hook-plugin registration for any other hook add-ons.)
 
 ## Remote control (optional)
 

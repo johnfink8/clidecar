@@ -50,7 +50,7 @@ def _int_field(d: dict[str, object], key: str) -> int:
 
 @dataclass(frozen=True)
 class HookEvent:
-    """The hook's stdin JSON. Fields vary by event; all optional."""
+    """The hook's stdin JSON — fields vary by event, hence all optional."""
     session_id: str | None = None
     transcript_path: str | None = None
     prompt: str | None = None
@@ -185,7 +185,7 @@ def track_live(state: TurnState, event: HookEvent) -> str:
 
 def live_text(live: LiveState | None) -> str:
     """The join of the segments reproduces the committed text exactly, so callers can drop
-    the live narration by identity once it lands in the transcript. "" if no buffer."""
+    the live narration by identity once it lands in the transcript."""
     if live is None:
         return ""
     segs = live.segments

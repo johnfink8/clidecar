@@ -10,7 +10,6 @@ import json
 import sys
 from typing import cast
 
-# A transcript row / content block: a JSON object whose fields are validated at access.
 Row = dict[str, object]
 Block = dict[str, object]
 

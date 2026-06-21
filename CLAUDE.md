@@ -3,8 +3,7 @@
 Self-recycling Claude harness: a long-running `claude` session supervised by a
 systemd --user service (`bin/sidecar.sh`) running inside a `screen` session. It
 can reset its own context, relaunch in a new workdir/params, and hot-swap its
-own supervisor. Full design in [SPEC.md](SPEC.md); user-facing overview in
-[README.md](README.md).
+own supervisor. User-facing overview + design in [README.md](README.md).
 
 ## Working on this repo
 
@@ -37,11 +36,20 @@ own supervisor. Full design in [SPEC.md](SPEC.md); user-facing overview in
   plugin). Symlinked onto PATH; resolves its own symlink to find the repo root.
 - `bin/notify-discord.sh` — bot-API ping for code paths that can't reach the MCP.
 - `bin/fallback.sh` — OnFailure one-shot: restore known-good sidecar, notify.
-- `bin/_pluginctl.py` — enable/disable/list plugins by editing `.claude/settings.json`.
-- `plugins/<name>/` — optional hook plugins, each self-contained with a `plugin.json`
-  (a Claude Code hooks fragment using a `${PLUGIN_DIR}` placeholder). `discord-bridge`
-  is the Discord output bridge (👀 ack reaction, live status mirror, deterministic
-  Stop-hook final answer). Enable with `clidecar plugin enable <name>` + recycle.
+- `bin/_pluginctl.py` — enable/disable/list hook plugins by editing `.claude/settings.json`.
+- `bridge/` — the channel-agnostic output-bridge CORE (the only Claude-aware code).
+  `hook-{ack,progress,final}.py` = the UserPromptSubmit / PostToolUse+MessageDisplay / Stop
+  hooks (👀 ack reaction, live status mirror, deterministic Stop-hook final answer);
+  `_hooklib.py` = shared per-turn state + rendering + the `channel_*` transport calls;
+  `transcript.py` = transcript-JSONL parsing; `channel.py` = resolves the active messaging
+  channel → transport script + capabilities. Typed under **pyright strict**
+  (`pyrightconfig.json`); JSON boundaries validated via each dataclass's `from_obj` builder.
+  The hooks are registered directly in `.claude/settings.json` (core, not a toggle-able plugin).
+- `plugins/<name>/` — messaging-channel ADAPTERS: a dumb transport that knows nothing about
+  Claude. A `plugin.json` manifest (`{kind:"messaging", transport, capabilities:{edit,react,
+  latest}}`) + a transport script (send/edit/react/latest). `plugins/discord/` (`msg.sh`) is
+  the bundled one. The bridge picks the active adapter at runtime — `config.env` `CHANNEL`,
+  else the sole installed messaging plugin — and degrades around any capability it doesn't declare.
 - `systemd/` — the supervisor unit + the OnFailure unit.
 - `~/.clidecar/control/` — runtime flags (`RECYCLE`) + `claude.pid`.
 - `~/.clidecar/state/` — live `state.md` (the "now") + `queue.md` (backlog).

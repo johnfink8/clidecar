@@ -75,14 +75,14 @@ def deliver(sid: str | None, text: str) -> bool:
 
 
 def finalize(state: h.TurnState, turn: list[t.Row], require: bool = False) -> bool:
-    """Decorate the status block done: render the SAME turn_lines the live block already
-    showed — never a subset, so the closing the user is reading is never removed — and swap
-    only the trailing footer ⏳→✅ (plus the 👀→✅ react). `require` means the answer lives
-    ONLY in this block (no separate post), so a failed or absent edit returns False and the
-    caller posts it instead — the answer is never dropped."""
+    """`require` means the closing answer lives ONLY in this block, so a failed/absent edit
+    returns False for the caller to post instead — never dropped. Otherwise the closing went
+    out as its own message: freeze work_lines, not turn_lines, because a closing too long to
+    fit would make render() roll every work line off down to a lone footer."""
     mid = state.message_id
     if mid:
-        lines = h.turn_lines(turn)[state.base:]
+        items = h.turn_lines(turn) if require else h.work_lines(turn)
+        lines = items[state.base:]
         if not h.channel_edit(mid, h.render(lines, footer=f"{h.DONE} *done*")) and require:
             return False
     elif require:

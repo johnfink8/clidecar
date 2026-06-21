@@ -27,7 +27,7 @@ import socket
 import threading
 import time
 from dataclasses import asdict, dataclass
-from typing import IO, Callable
+from typing import IO, Callable, Literal
 
 import transcript as t
 
@@ -36,10 +36,12 @@ OP_RETRIES = 2       # the gateway retries a transient adapter failure so hooks 
 OP_BACKOFF_S = 0.5
 NO_CLAUDE_REACT = "❌"  # honest non-delivery: react when no Claude is attached, leaving control with the user
 
+Kind = Literal["message", "question", "notice"]  # the outbound kinds; half of the (kind, dedup_key) idempotency token
+
 Clock = Callable[[], float]
 Transport = Callable[..., tuple[int, str]]       # the adapter shell-out: (verb, *args) -> (returncode, stdout)
-OnRequest = Callable[["dict[str, object]"], "dict[str, object] | None"]  # one MCP request -> its JSON-RPC response (None = notification)
-Notify = Callable[["Inbound"], "dict[str, object]"]                      # build the notifications/claude/channel frame for an inbound
+OnRequest = Callable[["dict[str, object]"], "dict[str, object] | None"]
+Notify = Callable[["Inbound"], "dict[str, object]"]
 
 
 @dataclass(frozen=True)
@@ -68,7 +70,7 @@ class Outbound:
     emitted twice (Claude's closing hook vs. a gateway echo of it) is sent once. dedup_key=None opts
     out — for genuinely distinct messages like the streamed status frames."""
     text: str
-    kind: str                      # "status" | "closing" | "question" | "file" | "notice" | "reply"
+    kind: Kind
     source: str                    # "claude" | "gateway" | "tool"
     dedup_key: str | None = None
     reply_to: str | None = None
@@ -190,8 +192,10 @@ class Broker:
                     self._claims.remove(claim)
                     try:
                         _send_line(claim.conn, {"reply": asdict(msg)})
-                    finally:
+                    except OSError:
                         claim.conn.close()
+                        continue  # dead waiter — msg NOT consumed; fall through to Claude/❌, never a silent drop
+                    claim.conn.close()
                     return f"exchange:{claim.label}"
         with self._chan_lock:
             chan = self._channel
@@ -260,7 +264,7 @@ class Broker:
                 self._claims.insert(0, claim)
         elif op == "emit":
             mid = self.emit(Outbound(
-                text=str(req.get("text", "")), kind=str(req.get("kind", "notice")),
+                text=str(req.get("text", "")), kind=as_kind(req.get("kind")),
                 source=str(req.get("source", "gateway")),
                 dedup_key=_opt_str(req, "dedup_key"), reply_to=_opt_str(req, "reply_to"),
             ))
@@ -391,6 +395,15 @@ def latest(*, sock_path: str = SOCK_PATH) -> str | None:
     resp = _request({"op": "latest"}, sock_path)
     v = resp.get("id") if resp is not None else None
     return v if isinstance(v, str) else None
+
+
+def as_kind(v: object) -> Kind:
+    """Narrow a wire-supplied kind to a known value — the emit op crosses the socket as untyped JSON."""
+    if v == "message":
+        return "message"
+    if v == "question":
+        return "question"
+    return "notice"
 
 
 def _num(req: dict[str, object] | None, key: str, default: float) -> float:

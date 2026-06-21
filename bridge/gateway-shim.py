@@ -12,13 +12,14 @@ client (ask/emit) on the same socket. If the daemon isn't up yet (the supervisor
 Claude, but races happen) the shim retries briefly, then exits — CC sees the channel fail loudly
 rather than the shim hanging.
 """
-import os
 import socket
 import sys
 import threading
 import time
 
-SOCK_PATH = os.path.expanduser("~/.clidecar/control/gateway.sock")
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+from exchange import SOCK_PATH  # the daemon owns the socket path; the shim must not re-declare it
+
 CONNECT_TRIES = 50
 CONNECT_DELAY = 0.2
 

@@ -37,10 +37,10 @@ SERVER_VERSION = "0.1.0"
 PROTOCOL_FALLBACK = "2024-11-05"
 POLL_INTERVAL_S = 3.0
 TRANSPORT_TIMEOUT_S = 30.0  # bound each adapter shell-out so a hung/429-sleeping call can't wedge us
-POLL_FAIL_ALERT_AFTER = 5   # consecutive dead polls / listener restarts before re-escalating
+POLL_FAIL_ALERT_AFTER = 5
 LISTEN_FATAL_EXIT = 4       # listen.py (FATAL_EXIT) says "WS won't recover — fall back to poll"
 LISTEN_HEALTHY_RUN_S = 30.0  # a listener run this long counts as a healthy connection that dropped
-LISTEN_MAX_RESTARTS = 5     # consecutive unhealthy listener restarts before falling back to poll
+LISTEN_MAX_RESTARTS = 5
 
 EVENTS_LOG = os.path.expanduser("~/.clidecar/state/gateway-events.jsonl")
 LISTEN_ERR_LOG = os.path.expanduser("~/.clidecar/state/listen-stderr.log")
@@ -364,7 +364,11 @@ def listen_loop(stop: threading.Event, broker: ex.Broker) -> bool:
                 if inb is None:
                     log_event("listen_drop_malformed", {"msg": obj})
                     continue
-                outcome = broker.route_inbound(inb)
+                try:
+                    outcome = broker.route_inbound(inb)
+                except Exception as e:  # one bad delivery must not fell the (otherwise silent) listener
+                    log_event("route_error", {"message_id": mid, "via": "listen", "error": repr(e)})
+                    continue
                 log_event("delivered", {"message_id": mid, "via": "listen", "to": outcome})
                 delivered = True
         code = proc.wait()
@@ -439,6 +443,22 @@ def handle_request(req: "dict[str, object]") -> "dict[str, object] | None":
     return _error(req_id, -32601, f"method not found: {method}")
 
 
+def _run_inbound(stop: threading.Event, broker: ex.Broker) -> None:
+    """Bring the whole daemon down loudly if the inbound loop dies unexpectedly (raises, or returns
+    while not stopping) — the supervisor then relaunches it — instead of a green pid with silently
+    dead inbound."""
+    try:
+        inbound_loop(stop, broker)
+        if stop.is_set():
+            return  # normal shutdown
+        reason = "inbound loop returned unexpectedly"
+    except Exception as e:
+        reason = f"inbound loop crashed: {e!r}"
+    log_event("inbound_dead", {"reason": reason})
+    alert(f"⚠️ clidecar {reason} — bringing the gateway down so the supervisor relaunches it.")
+    stop.set()
+
+
 def main() -> int:
     """Run the persistent daemon: serve the broker socket and route inbound through it until SIGTERM.
     Unlike the old stdio child, this process owns no MCP stream of its own — Claude attaches over the
@@ -455,7 +475,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
-    threading.Thread(target=inbound_loop, args=(stop, broker), daemon=True).start()
+    threading.Thread(target=_run_inbound, args=(stop, broker), daemon=True).start()
     sys.stderr.write(f"clidecar gateway daemon: up — broker @ {ex.SOCK_PATH}, channel {SERVER_NAME!r}\n")
 
     stop.wait()  # keep alive; SIGTERM/SIGINT sets stop (and reaps the listener) then exits

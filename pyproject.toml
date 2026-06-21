@@ -1,0 +1,36 @@
+[project]
+name = "clidecar-bridge"
+version = "0.1.0"
+description = "The Claude-aware bridge + gateway daemon for the clidecar harness."
+requires-python = ">=3.12"
+dependencies = [
+    "croniter>=3",
+    "holidays>=0.60",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8",
+    "pyright>=1.1.390",
+]
+
+# The bridge is run as scripts (gateway daemon, hooks, shim), not installed as a
+# package, so uv manages the env + deps without trying to build this project.
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+# Consolidated from the former pyrightconfig.json — single source of config.
+[tool.pyright]
+include = ["bridge"]
+typeCheckingMode = "strict"
+pythonVersion = "3.12"
+pythonPlatform = "Linux"
+venvPath = "."
+venv = ".venv"

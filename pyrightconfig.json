@@ -1,6 +1,0 @@
-{
-  "include": ["bridge"],
-  "typeCheckingMode": "strict",
-  "pythonVersion": "3.12",
-  "pythonPlatform": "Linux"
-}

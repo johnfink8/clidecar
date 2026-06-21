@@ -11,3 +11,6 @@ state/queue.md
 # Python bytecode from the hook scripts.
 __pycache__/
 *.pyc
+
+# uv-managed virtualenv (recreated from pyproject.toml + uv.lock via `uv sync`).
+.venv/

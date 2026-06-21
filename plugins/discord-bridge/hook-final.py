@@ -88,8 +88,8 @@ def finalize(state, turn, require=False):
         return False
     src = state.get("source_message_id")
     if src:
-        h.discord_react(src, h.SEEN, add=False)
-        h.discord_react(src, h.DONE)
+        h.discord_react(src, h.DONE)             # add ✅ first so the reaction row never empties
+        h.discord_react(src, h.SEEN, add=False)  # then drop 👀 — avoids a vertical-size flicker
     return True
 
 

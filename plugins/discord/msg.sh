@@ -110,6 +110,13 @@ print(d[0]["id"] if d and "id" in d[0] else ((int(time.time()*1000)-142007040000
     api_call GET "$url" || { echo "discord-msg: poll FAILED" >&2; exit 1; }
     printf '%s' "$RESP" | python3 "$(dirname "$0")/poll.py"
     ;;
+  fetch)
+    # Read-back: recent channel history, oldest-first, INCLUDING the bot's own messages (unlike
+    # poll, which gates them out). For verifying how output rendered, not for inbound dispatch.
+    limit="${2:-25}"
+    api_call GET "${API}?limit=${limit}" || { echo "discord-msg: fetch FAILED" >&2; exit 1; }
+    printf '%s' "$RESP" | python3 "$(dirname "$0")/history.py"
+    ;;
   listen)
     # Long-running push stream over the Gateway WS. exec so the core's reader gets python's
     # stdout directly; pass creds explicitly in case the .env didn't export them.
@@ -117,7 +124,7 @@ print(d[0]["id"] if d and "id" in d[0] else ((int(time.time()*1000)-142007040000
       exec python3 "$(dirname "$0")/listen.py"
     ;;
   *)
-    echo "usage: discord-msg.sh send \"text\" [reply_to] | edit <id> \"text\" | react|unreact <id> <emoji> [chan]" >&2
+    echo "usage: discord-msg.sh send \"text\" [reply_to] | edit <id> \"text\" | react|unreact <id> <emoji> [chan] | fetch [limit]" >&2
     exit 2
     ;;
 esac

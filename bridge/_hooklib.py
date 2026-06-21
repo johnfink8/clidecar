@@ -100,6 +100,7 @@ class LiveState:
 @dataclass
 class TurnState:
     source_message_id: str | None = None
+    chat_id: str | None = None
     done: str | None = None
     base: int = 0
     shown: int = 0
@@ -113,6 +114,7 @@ class TurnState:
         live = d.get("live")
         return cls(
             source_message_id=_str_field(d, "source_message_id"),
+            chat_id=_str_field(d, "chat_id"),
             done=_str_field(d, "done"),
             base=_int_field(d, "base"),
             shown=_int_field(d, "shown"),

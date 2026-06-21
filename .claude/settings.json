@@ -16,7 +16,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/john/clidecar/bridge/hook-question.py"
+            "command": "/home/john/clidecar/bridge/hook-question.py",
+            "timeout": 600
           }
         ]
       }

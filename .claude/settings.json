@@ -10,6 +10,17 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/john/clidecar/bridge/hook-question.py"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "*",

@@ -8,6 +8,11 @@ content (narration or a non-Discord tool), so an empty turn posts nothing — th
 reaction is the only acknowledgement. Re-homes (freezes the current message and starts a
 fresh one) when a newer message has landed below it — John writing mid-turn — carrying
 only the lines since the freeze so the new message never duplicates the old one.
+
+Everything is rendered at line granularity (split_units) and SPILLS append-only: when the
+shown tail no longer fits one message it freezes on a line boundary and continues in a fresh
+one, so a long answer — streamed or committed — lays itself out across messages and nothing
+already shown is ever removed. The Stop hook just caps the last message.
 """
 import sys
 
@@ -21,7 +26,8 @@ def main() -> None:
     sid = event.session_id
     is_md = event.hook_event_name == "MessageDisplay"
     turn = h.turn_from_path(event.transcript_path)
-    full = h.turn_lines(turn)
+    blocks = h.turn_lines(turn)
+    full = h.split_units(blocks)
     tid = t.turn_id(turn)
 
     # Locked so a concurrent PostToolUse + MessageDisplay can't both lazy-create the
@@ -31,9 +37,10 @@ def main() -> None:
         if tid is not None and state.done == tid:
             return  # THIS turn already finalized by the Stop hook — don't resurrect it
 
-        # Drop the live narration once the transcript commits it, so it never doubles.
+        # Drop the live narration once the transcript commits it (block-level identity), so the
+        # committed line-units aren't also re-appended from the live buffer.
         live = h.track_live(state, event) if is_md else h.live_text(state.live)
-        if live and ("text", live) in full:
+        if live and ("text", live) in blocks:
             state.live = None
             live = ""
 
@@ -43,15 +50,21 @@ def main() -> None:
         if mid and not is_md and h.can("latest"):
             latest = h.channel_latest()  # re-home on tool boundaries, not per narration segment
             if latest and latest != mid:
-                base, mid = state.shown, None  # freeze the old message; the new one starts here
+                base, mid = min(state.shown, len(full)), None  # freeze old message; new one starts here
 
-        lines = full[base:]
-        if live:
-            lines = lines + [("text", live)]
-        if not lines:
+        # The live narration's last line is still being typed; spill holds it unsealable so a seal
+        # always lands on a completed line. Spill runs on streaming too (is_md) — that's what makes
+        # a long pure-output answer lay itself out append-only instead of overflowing one message.
+        live_units = h.split_units([("text", live)]) if live else []
+
+        base, mid = h.spill(full, base, mid, live_units, h.WORKING_FOOTER, h.make_persist(sid, state))
+
+        combined = full + live_units
+        tail = combined[base:]
+        if not tail:
             return  # nothing new to show yet — never post a content-less status message
 
-        body = h.render(lines, footer=f"{h.WORKING} *working…*")
+        body = h.render(tail, footer=h.WORKING_FOOTER, open_lang=h.fence_state(combined[:base]))
         if mid:
             if body == state.last_body:
                 return  # unchanged — MessageDisplay can fire repeatedly mid-block; skip the redundant edit

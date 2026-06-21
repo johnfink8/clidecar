@@ -16,7 +16,7 @@ import os
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
-from typing import Generator
+from typing import Callable, Generator
 
 BIN = os.path.dirname(os.path.abspath(__file__))
 if BIN not in sys.path:
@@ -33,6 +33,15 @@ DONE = "✅"
 WORKING = "⏳"
 BODY_CAP = 1900  # headroom under Discord's 2000-char message limit
 TOOL_CAP = 120   # tool summaries stay one tidy line; narrations are never capped
+
+WORKING_FOOTER = f"{WORKING} *working…*"
+DONE_FOOTER = f"{DONE} *done*"
+DONE_PING = DONE_FOOTER  # the tiny end-of-turn message whose only job is a completion push; mirrors the cap
+# A sealed (spilled) message's footer. Kept to ONE char so sealing can never have to drop a
+# line the message already showed: a frozen prefix carrying this footer fits at least as many
+# lines as the live block did with the longer working footer. The fresh message below it is
+# the real "continued" cue.
+SPILL_FOOTER = "⏬"
 
 # A rendered status line: ("text", narration) kept whole, or ("tool", summary) one-line-capped.
 Item = tuple[str, str]
@@ -168,6 +177,21 @@ def work_lines(turn: list[t.Row]) -> list[Item]:
     return items
 
 
+def split_units(items: list[Item]) -> list[Item]:
+    """Flatten block items to line-granular UNITS: each narration line its own ("text", line)
+    unit, each tool summary one unit. Spilling seals whole units, so a long block breaks across
+    messages on line boundaries (never mid-line) — and the unit sequence is identical whether a
+    narration is mid-stream (live) or committed, so a unit index stays valid across that
+    transition (the basis for append-only streaming)."""
+    units: list[Item] = []
+    for kind, text in items:
+        if kind == "text":
+            units.extend(("text", ln) for ln in text.split("\n"))
+        else:
+            units.append((kind, text))
+    return units
+
+
 def track_live(state: TurnState, event: HookEvent) -> str:
     """MessageDisplay fires as each text segment is displayed, BEFORE the assistant
     message is committed to the transcript — so accumulating its deltas (keyed by index,
@@ -192,23 +216,134 @@ def live_text(live: LiveState | None) -> str:
     return "".join(segs[k] for k in sorted(segs, key=int)).strip()
 
 
-def render(items: list[Item], footer: str | None = None) -> str:
+def _line(item: Item) -> str:
+    kind, text = item
+    return text if kind == "text" else f"`{text[:TOOL_CAP]}`"
+
+
+def fence_state(items: list[Item]) -> str | None:
+    """The open ``` code-fence language after these items, or None if balanced/closed. A spill
+    boundary inside a fence needs this to reopen the block on the continuation message."""
+    inside = False
+    lang = ""
+    for kind, text in items:
+        if kind != "text":
+            continue
+        for line in text.split("\n"):
+            if line.lstrip().startswith("```"):
+                inside = not inside
+                lang = line.lstrip()[3:].strip() if inside else ""
+    return lang if inside else None
+
+
+def _balance_fences(lines: list[str], open_lang: str | None) -> list[str]:
+    """Make a message's content lines an independently-valid Discord block: reopen a ``` fence the
+    previous (sealed) message left open, and close one this message leaves open — so a code block
+    spanning a spill boundary renders correctly in BOTH messages instead of breaking."""
+    out = ([f"```{open_lang}"] if open_lang is not None else []) + lines
+    if sum(1 for ln in out if ln.lstrip().startswith("```")) % 2:
+        out.append("```")
+    return out
+
+
+def render(items: list[Item], footer: str | None = None, open_lang: str | None = None) -> str:
     """Newest-first fit of items into one Discord message: narrations whole, tool
     summaries one-line-capped. Oldest WHOLE items roll off only if the block would
     exceed Discord's size limit — a narration is never cut mid-text (a lone narration
-    over the cap is the only exception, hard-sliced as a last resort)."""
-    lines = [text if kind == "text" else f"`{text[:TOOL_CAP]}`" for kind, text in items]
-    if footer:
-        lines.append(footer)
+    over the cap is the only exception, hard-sliced as a last resort). open_lang reopens a
+    code fence the previous message left open; the footer stays outside the fence."""
+    budget = BODY_CAP - ((len(footer) + 1) if footer else 0)
+    content = [_line(it) for it in items]
     kept: list[str] = []
     total = 0
-    for line in reversed(lines):
-        if kept and total + len(line) + 1 > BODY_CAP:
+    for line in reversed(content):
+        if kept and total + len(line) + 1 > budget:
             break
         kept.append(line)
         total += len(line) + 1
     kept.reverse()
-    return "\n".join(kept)[:1990]
+    out = _balance_fences(kept, open_lang)
+    if footer:
+        out.append(footer)
+    return "\n".join(out)[:1990]
+
+
+def fits(items: list[Item], footer: str | None = None) -> bool:
+    """Whether render() would drop nothing — every item + footer fits one message."""
+    total = (len(footer) + 1) if footer else 0
+    return total + sum(len(_line(it)) + 1 for it in items) <= BODY_CAP
+
+
+def head_fit(items: list[Item], footer: str | None = None) -> int:
+    """How many LEADING items fit one message (oldest-first), at least 1. Used to seal the
+    fullest possible prefix into a frozen spill message; a lone over-cap item returns 1 and
+    is hard-sliced by render_head as the documented last resort."""
+    total = (len(footer) + 1) if footer else 0
+    n = 0
+    for it in items:
+        width = len(_line(it)) + 1
+        if n and total + width > BODY_CAP:
+            break
+        total += width
+        n += 1
+    return max(n, 1)
+
+
+def render_head(items: list[Item], footer: str | None = None, open_lang: str | None = None) -> str:
+    """Oldest-first render of a known-fitting prefix — the frozen body of a spilled message
+    (render() fits newest-first, which is wrong for a sealed head). open_lang reopens a code fence
+    the previous message left open; a fence this message leaves open is closed at its end."""
+    out = _balance_fences([_line(it) for it in items], open_lang)
+    if footer:
+        out.append(footer)
+    return "\n".join(out)[:1990]
+
+
+def make_persist(session_id: str | None, state: TurnState) -> Callable[[int, str | None], None]:
+    """spill()'s checkpoint: record base+message_id after each seal so a later failure can't
+    re-seal (duplicate) or strand. Lives next to spill() so both hooks share the one contract."""
+    def persist(base: int, mid: str | None) -> None:
+        state.base, state.message_id = base, mid
+        save_turn(session_id, state)
+    return persist
+
+
+def spill(
+    units: list[Item],
+    base: int,
+    mid: str | None,
+    live_units: list[Item],
+    footer: str,
+    persist: Callable[[int, str | None], None],
+) -> tuple[int, str | None]:
+    """Append-only seal: while the shown tail (units[base:] + live_units) overflows one message,
+    freeze the fullest sealable prefix into a frozen (⏬) message and advance base — never drop a
+    line already shown. The LAST live unit is held unsealable: it's the still-streaming line, so a
+    seal always lands on a completed line boundary. The first seal edits the live message into its
+    frozen form (mid→None); later seals open fresh frozen messages. On a send/edit failure it stops
+    WITHOUT advancing base past unposted lines (those stay in the live tail, retried/guaranteed by
+    the caller). persist(base, mid) records each successful seal immediately, so a later failure
+    can't re-seal (duplicate) or strand. Returns the new (base, mid); units[base:] then fits, unless
+    a lone over-cap unit remains (render hard-slices it, the documented last resort)."""
+    show = units + live_units
+    sealable = show[:-1]  # the LAST shown unit is the live tail (a still-streaming line) — never seal it
+    while not fits(show[base:], footer):
+        head = sealable[base:]
+        if not head:
+            break  # only the live tail remains and it alone exceeds the cap — render hard-slices it below
+        k = head_fit(head, SPILL_FOOTER)
+        sealed = render_head(head[:k], SPILL_FOOTER, fence_state(show[:base]))
+        if mid:
+            if not channel_edit(mid, sealed):
+                log_event("spill", {"outcome": "seal_edit_failed"})
+                break
+            mid = None
+        elif not channel_send(sealed):
+            log_event("spill", {"outcome": "seal_send_failed"})
+            break
+        base += k
+        persist(base, mid)
+    return base, mid
 
 
 def turn_from_path(path: str | None) -> list[t.Row]:

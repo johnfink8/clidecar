@@ -74,24 +74,31 @@ def deliver(sid: str | None, text: str) -> bool:
     return True
 
 
-def finalize(state: h.TurnState, turn: list[t.Row], require: bool = False) -> bool:
-    """`require` means the closing answer lives ONLY in this block, so a failed/absent edit
-    returns False for the caller to post instead — never dropped. Otherwise the closing went
-    out as its own message: freeze work_lines, not turn_lines, because a closing too long to
-    fit would make render() roll every work line off down to a lone footer."""
-    mid = state.message_id
+def lay_out(sid: str | None, state: h.TurnState, units: list[h.Item]) -> bool:
+    """Lay the turn's content out append-only across the status messages and cap the last in place
+    — never wipe-and-repost. The cap carries NO footer: the ⏳ working marker just drops, and the
+    separate ✅ DONE_PING is the sole done marker (so the cap can't duplicate it). Re-runs the spill
+    (the closing may have committed after the last progress render). Returns whether the full answer
+    is now shown across the messages; False (a single over-cap line, or a failed cap) tells the
+    caller to guarantee it via deliver()."""
+    base, mid = h.spill(units, state.base, state.message_id, [], h.DONE_FOOTER, h.make_persist(sid, state))
+    state.base, state.message_id = base, mid
+    tail = units[base:]
+    if not h.fits(tail, footer=h.DONE_FOOTER):
+        return False  # a single over-cap line can't be shown intact — deliver() guarantees it
+    body = h.render(tail, open_lang=h.fence_state(units[:base]))
     if mid:
-        items = h.turn_lines(turn) if require else h.work_lines(turn)
-        lines = items[state.base:]
-        if not h.channel_edit(mid, h.render(lines, footer=f"{h.DONE} *done*")) and require:
-            return False
-    elif require:
-        return False
+        return h.channel_edit(mid, body)
+    mid = h.channel_send(body)  # spill nulled mid sealing the prior chunk: this fresh cap continues it
+    state.message_id = mid
+    return bool(mid)
+
+
+def decorate_source(state: h.TurnState) -> None:
     src = state.source_message_id
     if src and h.can("react"):
         h.channel_react(src, h.DONE)             # add ✅ first so the reaction row never empties
         h.channel_react(src, h.SEEN, add=False)  # then drop 👀 — avoids a vertical-size flicker
-    return True
 
 
 def main() -> None:
@@ -127,30 +134,30 @@ def main() -> None:
         # whose closing answer we couldn't locate pings instead of going silent.
         return fail(sid, "couldn't locate the closing answer in the transcript; check console.")
 
-    # re-read: hook-progress may have created the status message during the poll.
-    state = h.load_turn(sid) or state
-    # The closing answer is already in the live status block (live-narration put it there;
-    # the block is append-only). Decorate THAT done rather than reposting — never remove the
-    # closing from the block to avoid a double. Post a separate message ONLY when the block
-    # can't hold the answer (too long) or doesn't exist, so the answer is still guaranteed.
-    fits = bool(text) and len(text) <= h.BODY_CAP - 40
-    in_block = bool(state.message_id) and fits and not already_sent
-
-    if already_sent:
-        h.log_event("Stop", {"outcome": "skip", "reason": "already_sent"})
-    elif in_block:
-        h.log_event("Stop", {"outcome": "in_block", "chars": len(text)})
-    elif not deliver(sid, text):
-        return
-
-    # Locked + re-read for the freshest message_id, then tombstone the turn so a straggler
-    # render can't resurrect it (the freeze and a trailing MessageDisplay can land in either
-    # order). finalize renders turn_lines + ✅; if the answer lives only there (in_block) and
-    # the edit can't land, fall back to a separate post — never drop.
+    # Locked + re-read for the freshest message_id (hook-progress may have created/advanced the
+    # status messages during the poll), then tombstone so a straggler render can't resurrect the
+    # turn (the cap and a trailing MessageDisplay can land in either order).
     with h.turn_lock(sid):
         state = h.load_turn(sid) or state
-        if not finalize(state, turn, require=in_block) and not deliver(sid, text):
-            return
+        # The answer already lives across the append-only status messages (the live narration
+        # streamed it there, spilling onto fresh messages as it grew). Cap the last in place —
+        # never wipe the text out and repost it. work_lines drops the trailing closing only when
+        # the reply tool already posted it as its own message (already_sent), to avoid a double.
+        units = h.split_units(h.work_lines(turn) if already_sent else h.turn_lines(turn))
+        covered = lay_out(sid, state, units)
+
+        if already_sent:
+            # The reply tool already posted the answer as its own message — it IS the done signal.
+            h.log_event("Stop", {"outcome": "skip", "reason": "already_sent"})
+        else:
+            if not covered and not deliver(sid, text):  # over-cap line / failed cap — guarantee it
+                return
+            h.log_event("Stop", {"outcome": "append_only" if covered else "delivered", "chars": len(text)})
+
+        decorate_source(state)
+        if not already_sent:
+            h.channel_send(h.DONE_PING)  # John's pick: one tiny ✅ message — the sole done marker + push
+
         if tid is not None:
             state.done = tid
             h.save_turn(sid, state)

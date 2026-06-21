@@ -6,11 +6,35 @@ active channel is config.env CHANNEL, else the sole installed messaging plugin.
 import json
 import os
 import sys
+from dataclasses import dataclass, field
+from typing import cast
 
 CONFIG = os.path.expanduser("~/.clidecar/config.env")
 
 
-def _repo_root():
+@dataclass(frozen=True)
+class Manifest:
+    kind: str | None = None
+    transport: str | None = None
+    capabilities: dict[str, bool] = field(default_factory=dict[str, bool])
+
+    @classmethod
+    def from_obj(cls, obj: object) -> "Manifest":
+        if not isinstance(obj, dict):
+            return cls()
+        d = cast("dict[str, object]", obj)  # JSON object: str keys, arbitrary values
+        kind = d.get("kind")
+        transport = d.get("transport")
+        caps_value = d.get("capabilities")
+        caps = cast("dict[str, object]", caps_value) if isinstance(caps_value, dict) else {}
+        return cls(
+            kind=kind if isinstance(kind, str) else None,
+            transport=transport if isinstance(transport, str) else None,
+            capabilities={k: bool(v) for k, v in caps.items()},
+        )
+
+
+def _repo_root() -> str:
     """Walk up from this file to the clidecar checkout (the dir containing plugins/). Works
     whether this module lives under plugins/<x>/ or bridge/."""
     d = os.path.dirname(os.path.abspath(__file__))
@@ -21,7 +45,7 @@ def _repo_root():
     raise RuntimeError("clidecar repo root (with plugins/) not found")
 
 
-def _read_config(key):
+def _read_config(key: str) -> str | None:
     try:
         with open(CONFIG, encoding="utf-8") as fh:
             for line in fh:
@@ -33,33 +57,34 @@ def _read_config(key):
     return None
 
 
-def _plugins_dir():
+def _plugins_dir() -> str:
     return os.path.join(_repo_root(), "plugins")
 
 
-def _manifest(name):
+def _manifest(name: str) -> Manifest:
     path = os.path.join(_plugins_dir(), name, "plugin.json")
     try:
         with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
+            parsed = json.load(fh)
     except FileNotFoundError:
-        return {}
+        return Manifest()
     except (OSError, json.JSONDecodeError) as e:
         # A present-but-broken manifest is a config error, not a missing plugin — say so
         # rather than silently demoting the plugin to "not a channel".
         sys.stderr.write(f"clidecar channel: unreadable manifest {path}: {e}\n")
-        return {}
+        return Manifest()
+    return Manifest.from_obj(parsed)
 
 
-def _messaging_plugins():
+def _messaging_plugins() -> list[str]:
     try:
         names = sorted(os.listdir(_plugins_dir()))
     except OSError:
         return []
-    return [n for n in names if _manifest(n).get("kind") == "messaging"]
+    return [n for n in names if _manifest(n).kind == "messaging"]
 
 
-def active():
+def active() -> tuple[str | None, str | None]:
     """(name, reason): the active messaging channel, or (None, reason) explaining why it
     couldn't be resolved. Active = config.env CHANNEL (if set and installed), else the sole
     messaging plugin. Zero plugins, an ambiguous set with no CHANNEL, or a CHANNEL naming a
@@ -78,20 +103,20 @@ def active():
     return msgs[0], None
 
 
-def transport():
+def transport() -> tuple[str | None, str | None]:
     """(script, reason): absolute path to the active channel's transport script, or
     (None, reason) if unresolved. The bridge's send/edit/react/latest all shell out to this
     one script."""
     name, reason = active()
     if not name:
         return None, reason
-    tpl = _manifest(name).get("transport")
+    tpl = _manifest(name).transport
     if not tpl:
         return None, f"channel {name!r} manifest declares no 'transport'"
     return tpl.replace("${PLUGIN_DIR}", os.path.join(_plugins_dir(), name)), None
 
 
-def capabilities():
+def capabilities() -> dict[str, bool]:
     """The active channel's declared capabilities (edit/react/latest); {} if none."""
     name, _ = active()
-    return _manifest(name).get("capabilities", {}) if name else {}
+    return _manifest(name).capabilities if name else {}

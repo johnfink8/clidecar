@@ -23,8 +23,9 @@ POLL_TRIES = 50
 POLL_INTERVAL = 0.1
 
 
-def chunks(text):
-    out, cur = [], ""
+def chunks(text: str) -> list[str]:
+    out: list[str] = []
+    cur = ""
     for line in text.split("\n"):
         if len(cur) + len(line) + 1 > CHUNK and cur:
             out.append(cur)
@@ -35,9 +36,9 @@ def chunks(text):
     return out or [text]
 
 
-def await_closing(transcript):
+def await_closing(transcript: str) -> tuple[list[t.Row], bool]:
     """Poll until the closing text is flushed; return (turn_rows, flushed)."""
-    turn = []
+    turn: list[t.Row] = []
     for _ in range(POLL_TRIES):
         turn = t.current_turn(t.load_rows(transcript))
         if t.closing_flushed(turn):
@@ -46,7 +47,7 @@ def await_closing(transcript):
     return turn, False
 
 
-def fail(sid, message, **log):
+def fail(sid: str | None, message: str, **log: object) -> None:
     """Surface a bridge failure loudly and stop — never mark the turn done."""
     h.log_event("Stop", {"outcome": "fail", "detail": message, **log})
     if not h.channel_send(f"⚠️ bridge: {message}"):
@@ -56,7 +57,7 @@ def fail(sid, message, **log):
     h.clear_turn(sid)
 
 
-def deliver(sid, text):
+def deliver(sid: str | None, text: str) -> bool:
     """Post the closing answer (chunked) to Discord; True on success. On refusal, log +
     persist + ⚠️ ping and return False so the caller bails — the answer is never lost
     silently."""
@@ -73,31 +74,31 @@ def deliver(sid, text):
     return True
 
 
-def finalize(state, turn, require=False):
+def finalize(state: h.TurnState, turn: list[t.Row], require: bool = False) -> bool:
     """Decorate the status block done: render the SAME turn_lines the live block already
     showed — never a subset, so the closing the user is reading is never removed — and swap
     only the trailing footer ⏳→✅ (plus the 👀→✅ react). `require` means the answer lives
     ONLY in this block (no separate post), so a failed or absent edit returns False and the
     caller posts it instead — the answer is never dropped."""
-    mid = state.get("message_id")
+    mid = state.message_id
     if mid:
-        lines = h.turn_lines(turn)[state.get("base", 0):]
+        lines = h.turn_lines(turn)[state.base:]
         if not h.channel_edit(mid, h.render(lines, footer=f"{h.DONE} *done*")) and require:
             return False
     elif require:
         return False
-    src = state.get("source_message_id")
+    src = state.source_message_id
     if src and h.can("react"):
         h.channel_react(src, h.DONE)             # add ✅ first so the reaction row never empties
         h.channel_react(src, h.SEEN, add=False)  # then drop 👀 — avoids a vertical-size flicker
     return True
 
 
-def main():
+def main() -> None:
     event = h.read_event("Stop")
-    sid = event.get("session_id")
-    transcript = event.get("transcript_path")
-    state = h.load_turn(sid) or {}
+    sid = event.session_id
+    transcript = event.transcript_path
+    state = h.load_turn(sid) or h.TurnState()
 
     if not transcript or not os.path.exists(transcript):
         return fail(sid, "Stop hook got no transcript — answer may be lost; check console.")
@@ -108,7 +109,7 @@ def main():
         return fail(sid, f"couldn't parse transcript (check console). {str(e)[:200]}")
 
     tid = t.turn_id(turn)
-    if tid is not None and state.get("done") == tid:
+    if tid is not None and state.done == tid:
         # THIS exact turn's closing was already posted — a re-entrant Stop.
         h.log_event("Stop", {"outcome": "skip", "reason": "already_finalized", "turn": tid})
         return
@@ -133,7 +134,7 @@ def main():
     # closing from the block to avoid a double. Post a separate message ONLY when the block
     # can't hold the answer (too long) or doesn't exist, so the answer is still guaranteed.
     fits = bool(text) and len(text) <= h.BODY_CAP - 40
-    in_block = bool(state.get("message_id")) and fits and not already_sent
+    in_block = bool(state.message_id) and fits and not already_sent
 
     if already_sent:
         h.log_event("Stop", {"outcome": "skip", "reason": "already_sent"})
@@ -151,7 +152,7 @@ def main():
         if not finalize(state, turn, require=in_block) and not deliver(sid, text):
             return
         if tid is not None:
-            state["done"] = tid
+            state.done = tid
             h.save_turn(sid, state)
         else:
             h.clear_turn(sid)

@@ -13,7 +13,7 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import transcript as t
 
 
-def main():
+def main() -> None:
     if len(sys.argv) < 2:
         sys.exit("usage: extract-final-text.py <transcript.jsonl|->")
     turn = t.current_turn(t.load_rows(sys.argv[1]))

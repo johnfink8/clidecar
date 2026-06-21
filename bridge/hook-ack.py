@@ -12,21 +12,21 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import _hooklib as h
 
 
-def source_message_id(prompt):
-    if "<channel" not in (prompt or ""):
+def source_message_id(prompt: str | None) -> str | None:
+    if not prompt or "<channel" not in prompt:
         return None
     m = re.search(r'message_id="([^"]+)"', prompt)
     return m.group(1) if m else None
 
 
-def main():
+def main() -> None:
     event = h.read_event("UserPromptSubmit")
-    sid = event.get("session_id")
-    mid = source_message_id(event.get("prompt"))
+    sid = event.session_id
+    mid = source_message_id(event.prompt)
     # Reset per-turn state every turn (clearing the prior turn's done tombstone), whether
     # or not this prompt carries a source message to react to.
     with h.turn_lock(sid):
-        h.save_turn(sid, {"source_message_id": mid} if mid else {})
+        h.save_turn(sid, h.TurnState(source_message_id=mid))
     if not mid:
         h.log_event("UserPromptSubmit", {"outcome": "no_source_message"})
         return

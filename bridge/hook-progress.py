@@ -16,35 +16,34 @@ import _hooklib as h
 import transcript as t
 
 
-def main():
+def main() -> None:
     event = h.read_event("PostToolUse")
-    sid = event.get("session_id")
-    is_md = event.get("hook_event_name") == "MessageDisplay"
-    turn = h.turn_from_path(event.get("transcript_path"))
+    sid = event.session_id
+    is_md = event.hook_event_name == "MessageDisplay"
+    turn = h.turn_from_path(event.transcript_path)
     full = h.turn_lines(turn)
     tid = t.turn_id(turn)
 
     # Locked so a concurrent PostToolUse + MessageDisplay can't both lazy-create the
     # status message; the second to enter sees the message_id and edits instead.
     with h.turn_lock(sid):
-        state = h.load_turn(sid) or {}
-        if tid is not None and state.get("done") == tid:
+        state = h.load_turn(sid) or h.TurnState()
+        if tid is not None and state.done == tid:
             return  # THIS turn already finalized by the Stop hook — don't resurrect it
 
         # Drop the live narration once the transcript commits it, so it never doubles.
-        live = h.track_live(state, event) if is_md else h.live_text(state.get("live"))
+        live = h.track_live(state, event) if is_md else h.live_text(state.live)
         if live and ("text", live) in full:
-            state.pop("live", None)
+            state.live = None
             live = ""
 
-        base = state.get("base", 0)
-        shown = state.get("shown", 0)
-        mid = state.get("message_id")
+        base = state.base
+        mid = state.message_id
 
         if mid and not is_md and h.can("latest"):
             latest = h.channel_latest()  # re-home on tool boundaries, not per narration segment
             if latest and latest != mid:
-                base, mid = shown, None  # freeze the old message; the new one starts here
+                base, mid = state.shown, None  # freeze the old message; the new one starts here
 
         lines = full[base:]
         if live:
@@ -54,7 +53,7 @@ def main():
 
         body = h.render(lines, footer=f"{h.WORKING} *working…*")
         if mid:
-            if body == state.get("last_body"):
+            if body == state.last_body:
                 return  # unchanged — MessageDisplay can fire repeatedly mid-block; skip the redundant edit
             h.channel_edit(mid, body)
         else:
@@ -62,7 +61,10 @@ def main():
             if not mid:
                 h.log_event("PostToolUse", {"outcome": "send_failed"})
                 return
-        state.update(base=base, shown=len(full), last_body=body, message_id=mid)
+        state.base = base
+        state.shown = len(full)
+        state.last_body = body
+        state.message_id = mid
         h.save_turn(sid, state)
 
 

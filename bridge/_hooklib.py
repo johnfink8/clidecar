@@ -1,8 +1,8 @@
-"""Shared helpers for the clidecar Discord hooks (ack / progress / final).
+"""Shared helpers for the clidecar bridge hooks (ack / progress / final).
 
 Per-turn state is one JSON file keyed by session id so the three hooks — which run
-as separate processes — can find the same ack message. Discord I/O is delegated to
-bin/discord-msg.sh (single source of the bot-API call).
+as separate processes — can find the same status message. Channel I/O is delegated to
+the active channel's transport script, resolved by channel.py (provider-agnostic).
 """
 import contextlib
 import datetime
@@ -228,10 +228,14 @@ def turn_lock(session_id):
 
 
 def _transport(*args):
-    """Run the active channel's transport script; (returncode, stdout) or (1, "") if no
-    channel is configured. The single shell-out point for all channel I/O."""
-    script = channel.transport()
+    """Run the active channel's transport script; (returncode, stdout). The single shell-out
+    point for all channel I/O. Returns (1, "") if no channel resolves — but logs that loudly
+    first (events.jsonl + stderr) so a misconfigured bridge is diagnosable, not a silent
+    no-op indistinguishable from a transient send failure."""
+    script, reason = channel.transport()
     if not script:
+        log_event("channel_unresolved", {"reason": reason, "verb": args[0] if args else None})
+        sys.stderr.write(f"clidecar bridge: no messaging channel resolved — {reason}\n")
         return 1, ""
     out = subprocess.run([script, *args], capture_output=True, text=True)
     if out.returncode != 0:

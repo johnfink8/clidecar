@@ -60,6 +60,7 @@ def main():
         else:
             mid = h.channel_send(body)
             if not mid:
+                h.log_event("PostToolUse", {"outcome": "send_failed"})
                 return
         state.update(base=base, shown=len(full), last_body=body, message_id=mid)
         h.save_turn(sid, state)

@@ -36,25 +36,19 @@ import exchange as ex
 SERVER_NAME = "clidecar"
 SERVER_VERSION = "0.1.0"
 PROTOCOL_FALLBACK = "2024-11-05"
-POLL_INTERVAL_S = 3.0
 TRANSPORT_TIMEOUT_S = (
     30.0  # bound each adapter shell-out so a hung/429-sleeping call can't wedge us
 )
-POLL_FAIL_ALERT_AFTER = 5
-# listen.py (FATAL_EXIT) signals "WS impaired — alert + relaunch it", never demote to poll
+# listen.py (FATAL_EXIT) signals "WS impaired — alert + relaunch it"
 LISTEN_FATAL_EXIT = 4
 LISTEN_HEALTHY_RUN_S = 30.0  # a listener run this long counts as a healthy connection that dropped
 LISTEN_MAX_RESTARTS = 5
 LISTEN_ALERT_COOLDOWN_S = 600.0  # throttle impairment pings: at most one per this window
+LISTEN_FAIL_ALERT_AFTER = 5  # alert after this many consecutive channel-unresolved failures
 
 EVENTS_LOG = os.path.expanduser("~/.clidecar/state/gateway-events.jsonl")
 LISTEN_ERR_LOG = os.path.expanduser("~/.clidecar/state/listen-stderr.log")
 NOTIFY = os.path.expanduser("~/clidecar/bin/notify-discord.sh")
-
-
-class TransportError(Exception):
-    """The adapter shell-out failed (no channel, dead token, Discord error, network). Inbound is
-    the SOLE path in, so a failed poll must never be mistaken for an empty one — raise, don't []."""
 
 
 def log_event(kind: str, detail: "dict[str, object]") -> None:
@@ -97,7 +91,7 @@ def _error(req_id: object, code: int, message: str) -> "dict[str, object]":
 def _transport(*args: str) -> "tuple[int, str]":
     """The single shell-out point — same resolution the outbound hooks use, so the gateway never
     names a transport. Timeout-bounded so a hung or rate-limit-sleeping adapter call can't wedge
-    the caller (the poll path's silent-stall mode)."""
+    the caller."""
     script, reason = channel.transport()
     if not script:
         sys.stderr.write(f"clidecar gateway: no channel resolved — {reason}\n")
@@ -218,37 +212,6 @@ def call_tool(name: str, args: "dict[str, object]") -> "tuple[str, bool]":
     return f"unknown tool: {name}", True
 
 
-def _channel_cursor() -> str:
-    """Opaque inbound baseline from the adapter — the newest message id, or a synthetic 'from now'
-    token on an empty channel. Never None: the adapter owns the empty case so the gateway can't
-    collapse it to a no-cursor poll that back-fills history. Raises if it can't produce one."""
-    code, out = _transport("cursor")
-    if code != 0 or not out.strip():
-        raise TransportError("cursor")
-    return out.strip()
-
-
-def _channel_poll(after: str) -> "list[dict[str, object]]":
-    """Oldest-first, as the adapter emits them. Always from a real cursor — never a no-after fetch,
-    which would back-fill history. Raises TransportError on adapter failure so the caller can't
-    read a broken channel as an empty one."""
-    code, out = _transport("poll", after)
-    if code != 0:
-        raise TransportError("poll")
-    rows: list[dict[str, object]] = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            rows.append(cast("dict[str, object]", obj))
-    return rows
-
-
 def _channel_frame(msg: ex.Inbound) -> "dict[str, object]":
     """Build the notifications/claude/channel frame for an inbound — the Broker's `notify`. CC turns
     `source` (our server name) + each meta key into a <channel> envelope attribute."""
@@ -266,56 +229,6 @@ def _channel_frame(msg: ex.Inbound) -> "dict[str, object]":
             },
         },
     }
-
-
-def poll_loop(stop: threading.Event, broker: ex.Broker) -> None:
-    """Baseline at the channel's current cursor (don't replay history), then route each new
-    message through the broker as it arrives. Adapter failures keep the loop alive but are never
-    swallowed: every failure is logged, and sustained failure escalates out-of-band — because this
-    is the sole way in, a silent dead loop is indistinguishable from an idle channel until the user
-    notices the silence. A failed baseline retries rather than being skipped (which would replay)."""
-    after = ""
-    have_baseline = False
-    fails = 0
-    alerted = False
-    while not stop.is_set():
-        try:
-            if not have_baseline:
-                after = _channel_cursor()
-                have_baseline = True
-                log_event("poll_baseline", {"after": after})
-            else:
-                for msg in _channel_poll(after):
-                    mid = msg.get("id")
-                    if not isinstance(mid, str):
-                        # Can't checkpoint it → would re-deliver forever. Refuse loudly, don't route.
-                        log_event("poll_drop_no_id", {"msg": msg})
-                        continue
-                    inb = ex.Inbound.from_obj(msg)
-                    if inb is None:
-                        log_event("poll_drop_malformed", {"msg": msg})
-                        after = mid  # checkpoint past it — a malformed row won't become deliverable
-                        continue
-                    outcome = broker.route_inbound(inb)
-                    log_event("delivered", {"message_id": mid, "prev_after": after, "to": outcome})
-                    after = mid
-            if fails:
-                log_event("poll_recovered", {"after_failures": fails})
-            fails, alerted = 0, False
-        except Exception as e:
-            fails += 1
-            log_event(
-                "poll_error",
-                {"error": repr(e), "consecutive": fails, "have_baseline": have_baseline},
-            )
-            sys.stderr.write(f"clidecar gateway: poll failed ({fails}x): {e!r}\n")
-            if fails >= POLL_FAIL_ALERT_AFTER and not alerted:
-                alert(
-                    f"⚠️ clidecar inbound gateway: {fails} consecutive poll failures — "
-                    f"inbound may be DOWN ({e!r}). Check the channel/token."
-                )
-                alerted = True
-        stop.wait(POLL_INTERVAL_S)
 
 
 _active_child: "subprocess.Popen[str] | None" = None
@@ -350,12 +263,11 @@ def _terminate_child() -> None:
 
 
 def listen_loop(stop: threading.Event, broker: ex.Broker) -> None:
-    """Stream inbound from an adapter that declares `listen` (push): read gate.shape() JSON lines
-    from the long-running adapter process and route each through the broker — no polling, no
-    cursor. listen.py handles its own transient reconnects, so an exit is meaningful: an impairment
-    (token / intent / link down past its watchdog) or a crash that keeps recurring. WS-only by
-    John's call: we ALWAYS relaunch the WS with backoff and alert on impairment — never demote to
-    REST polling. Returns only when stopped."""
+    """Stream inbound from the adapter's `listen` (WS push) — the sole inbound path. Read
+    gate.shape() JSON lines from the long-running adapter process and route each through the broker
+    as it arrives. listen.py handles its own transient reconnects, so an exit is meaningful: an
+    impairment (token / intent / link down past its watchdog) or a crash that keeps recurring. We
+    ALWAYS relaunch the WS with backoff and alert on impairment. Returns only when stopped."""
     global _active_child
     fails = 0
     backoff = 1.0
@@ -367,7 +279,7 @@ def listen_loop(stop: threading.Event, broker: ex.Broker) -> None:
             log_event(
                 "listen_error", {"error": f"unresolved channel: {reason}", "consecutive": fails}
             )
-            if fails % POLL_FAIL_ALERT_AFTER == 0:
+            if fails % LISTEN_FAIL_ALERT_AFTER == 0:
                 alert(f"⚠️ clidecar inbound: channel unresolved — {reason}")
             stop.wait(backoff)
             backoff = min(backoff * 2, 30.0)
@@ -442,7 +354,7 @@ def listen_loop(stop: threading.Event, broker: ex.Broker) -> None:
             if now - last_alert >= LISTEN_ALERT_COOLDOWN_S:
                 alert(
                     f"⚠️ clidecar inbound (WS) impaired — {why or 'token / MESSAGE_CONTENT intent / outage'}. "
-                    "Retrying the WS; not polling."
+                    "Retrying the WS."
                 )
                 last_alert = now
         elif healthy:
@@ -460,7 +372,7 @@ def listen_loop(stop: threading.Event, broker: ex.Broker) -> None:
             if fails >= LISTEN_MAX_RESTARTS and now - last_alert >= LISTEN_ALERT_COOLDOWN_S:
                 alert(
                     f"⚠️ clidecar inbound (WS): listener crash-looping ({fails}x, last exit {code}: {why}). "
-                    "Retrying the WS; not polling."
+                    "Retrying the WS."
                 )
                 last_alert = now
         stop.wait(backoff)
@@ -468,13 +380,21 @@ def listen_loop(stop: threading.Event, broker: ex.Broker) -> None:
 
 
 def inbound_loop(stop: threading.Event, broker: ex.Broker) -> None:
-    """Push (`listen`) when the adapter declares it, else REST polling. The listen path is WS-only
-    (John): listen_loop retries the WS and alerts on impairment, never demoting to poll — so poll
-    is reached only by an adapter that can't push at all."""
-    if bool(channel.capabilities().get("listen")):
-        listen_loop(stop, broker)
-    else:
-        poll_loop(stop, broker)
+    """Stream inbound over the adapter's `listen` (WS push) — the sole inbound path. `listen` is a
+    hard precondition: an adapter that doesn't declare it has no way in. Fail LOUD at boot (alert +
+    hold) rather than enter listen_loop, where a `listen` verb that blocks without output would hang
+    as a green-pid-but-silently-dead daemon. Retrying can't help — a capability only changes with a
+    redeploy + restart — so we alert once and hold instead of churning the supervisor."""
+    if not bool(channel.capabilities().get("listen")):
+        reason = "active channel adapter declares no `listen` capability — inbound is dead"
+        log_event("inbound_no_listen", {"reason": reason})
+        sys.stderr.write(f"clidecar gateway: {reason}\n")
+        alert(
+            f"⚠️ clidecar inbound DOWN at boot: {reason}. Fix the adapter and restart the gateway."
+        )
+        stop.wait()
+        return
+    listen_loop(stop, broker)
 
 
 def handle_request(req: "dict[str, object]") -> "dict[str, object] | None":

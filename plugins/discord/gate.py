@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Gate + shape one raw Discord message into a deliverable inbound line for the clidecar gateway.
 
-Shared by both inbound paths — poll.py (REST batch) and listen.py (Gateway WS stream) — so the
-security boundary and the line shape live in ONE place. A deliverable line is:
+Used by the inbound listen path (listen.py, the Gateway WS stream), so the security boundary and
+the line shape live in ONE place. A deliverable line is:
   {"id","chat_id","user","user_id","content","ts"}
 Gating is the channel's security boundary (drop bots + anyone not in access.json allowFrom, fail
 closed), so it lives here in the Discord-aware adapter, never in the Claude-facing gateway.

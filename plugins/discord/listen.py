@@ -2,18 +2,17 @@
 """Stream inbound Discord messages over the Gateway WebSocket as deliverable JSON lines (push).
 
 `msg.sh listen` holds a Discord Gateway connection (via discord.py) and writes one gate.shape()
-line per new allowed message in the configured channel to stdout, flushed, as it arrives — the push
-counterpart to poll.py's REST batch. discord.py owns the Gateway lifecycle (heartbeat, RESUME,
-reconnect with backoff).
+line per new allowed message in the configured channel to stdout, flushed, as it arrives — the
+sole inbound path. discord.py owns the Gateway lifecycle (heartbeat, RESUME, reconnect with
+backoff).
 
-gate.py remains the single gating + line-shaping authority, shared with poll.py, so the security
-boundary lives in ONE place across both inbound paths.
+gate.py is the single gating + line-shaping authority, so the security boundary lives in ONE place.
 
-Fail-loud, WS-only (John's call): anything the WS can't recover from — a bad token, the
-MESSAGE_CONTENT privileged intent disabled, or the link staying down past DOWN_GRACE (never
-connecting, or a post-READY outage discord.py reconnects through forever without success) — exits
-FATAL_EXIT. The core (gateway.LISTEN_FATAL_EXIT) then alerts and relaunches the WS; it never demotes
-to REST polling. Exiting is how a silently-dead link becomes loud, not how we abandon the WS.
+Fail-loud: anything the WS can't recover from — a bad token, the MESSAGE_CONTENT privileged intent
+disabled, or the link staying down past DOWN_GRACE (never connecting, or a post-READY outage
+discord.py reconnects through forever without success) — exits FATAL_EXIT. The core
+(gateway.LISTEN_FATAL_EXIT) then alerts and relaunches the WS. Exiting is how a silently-dead link
+becomes loud, not how we abandon the WS.
 """
 
 import asyncio

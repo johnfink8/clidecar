@@ -8,8 +8,6 @@
 #   discord-msg.sh react   <message_id> <emoji> [channel]  -> add the bot's reaction
 #   discord-msg.sh unreact <message_id> <emoji> [channel]  -> remove the bot's reaction
 #   discord-msg.sh latest                                  -> prints the newest message id
-#   discord-msg.sh cursor                                  -> inbound baseline (newest id, or now)
-#   discord-msg.sh poll    [after_message_id]              -> JSON lines of new inbound msgs (REST)
 #   discord-msg.sh listen                                  -> stream inbound JSON lines (Gateway WS)
 #
 # Every call retries on HTTP 429 honoring Discord's retry_after — the reaction endpoint
@@ -95,24 +93,9 @@ case "$cmd" in
     api_call GET "${API}?limit=1" || { echo "discord-msg: latest FAILED" >&2; exit 1; }
     printf '%s' "$RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["id"] if d and "id" in d[0] else "")'
     ;;
-  cursor)
-    # Inbound baseline for the gateway: newest message id, or — on an empty channel — a snowflake
-    # synthesized from NOW (Discord epoch 1420070400000, ms<<22). Always non-empty, so the gateway
-    # never back-fills history yet still sees the first message that lands after boot.
-    api_call GET "${API}?limit=1" || { echo "discord-msg: cursor FAILED" >&2; exit 1; }
-    printf '%s' "$RESP" | python3 -c 'import json,sys,time
-d=json.load(sys.stdin)
-print(d[0]["id"] if d and "id" in d[0] else ((int(time.time()*1000)-1420070400000)<<22))'
-    ;;
-  poll)
-    after="${2:-}"
-    if [ -n "$after" ]; then url="${API}?limit=50&after=${after}"; else url="${API}?limit=50"; fi
-    api_call GET "$url" || { echo "discord-msg: poll FAILED" >&2; exit 1; }
-    printf '%s' "$RESP" | python3 "$(dirname "$0")/poll.py"
-    ;;
   fetch)
     # Read-back: recent channel history, oldest-first, INCLUDING the bot's own messages (unlike
-    # poll, which gates them out). For verifying how output rendered, not for inbound dispatch.
+    # the gated inbound stream, which drops them). For verifying how output rendered, not dispatch.
     limit="${2:-25}"
     api_call GET "${API}?limit=${limit}" || { echo "discord-msg: fetch FAILED" >&2; exit 1; }
     printf '%s' "$RESP" | python3 "$(dirname "$0")/history.py"

@@ -124,6 +124,6 @@ def transport() -> tuple[str | None, str | None]:
 
 
 def capabilities() -> dict[str, bool]:
-    """The active channel's declared capabilities (edit/react/latest); {} if none."""
+    """The active channel's declared capabilities (e.g. edit/react/latest/listen/fetch); {} if none."""
     name, _ = active()
     return _manifest(name).capabilities if name else {}

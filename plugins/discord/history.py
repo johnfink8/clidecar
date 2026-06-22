@@ -2,10 +2,10 @@
 """Render recent Discord channel history into readable lines, oldest-first, for the gateway's
 read-back tool (`msg.sh fetch` -> `clidecar_fetch`).
 
-Distinct from poll.py/gate.py on purpose: that path GATES inbound (drops bots + non-allowlisted
-senders so untrusted input can't drive Claude). This is a deliberate READ of what's in the
-channel, so it keeps every message — the bot's own replies included, since verifying how output
-rendered is the whole point. Each line names its author so untrusted content stays visibly so.
+Distinct from gate.py on purpose: that path GATES inbound (drops bots + non-allowlisted senders so
+untrusted input can't drive Claude). This is a deliberate READ of what's in the channel, so it
+keeps every message — the bot's own replies included, since verifying how output rendered is the
+whole point. Each line names its author so untrusted content stays visibly so.
 
 stdin: the raw JSON array from GET /channels/{id}/messages (newest-first, as Discord returns it).
 stdout: one readable line per message, oldest-first.

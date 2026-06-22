@@ -78,11 +78,12 @@ overview + design in [README.md](README.md).
 - `plugins/<name>/` — messaging-channel ADAPTERS: a dumb transport that knows nothing about
   Claude. A `plugin.json` manifest (`{kind:"messaging", transport, capabilities}`) + a
   transport script. `plugins/discord/`: `msg.sh` (send/edit/react/latest/fetch via the bot
-  API) + `listen.py` (hand-rolled Discord Gateway WS streamer = inbound push) + `poll.py`
+  API) + `listen.py` (discord.py Gateway WS streamer = inbound push) + `poll.py`
   (REST poll fallback) + `gate.py` (shared inbound gate+shape: drop bots + non-allowlisted,
   fail-closed) + `history.py` (channel read-back). The gateway picks the adapter at runtime —
   `config.env` `CHANNEL`, else the sole installed messaging plugin — and degrades around any
-  capability it doesn't declare.
+  capability it doesn't declare. **Writing a new adapter: [plugins/README.md](plugins/README.md)** —
+  the full manifest + verb + inbound-line-shape contract, no reverse-engineering needed.
 - `systemd/` — the supervisor unit + the OnFailure unit.
 - `pyproject.toml` — uv project: runtime deps (croniter, holidays) + dev tooling (ruff,
   pyright) + their config. `uv sync` builds `.venv`; the daemon runs under it via `PYTHON_BIN`.

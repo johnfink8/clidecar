@@ -41,9 +41,11 @@ TRANSPORT_TIMEOUT_S = (
     30.0  # bound each adapter shell-out so a hung/429-sleeping call can't wedge us
 )
 POLL_FAIL_ALERT_AFTER = 5
-LISTEN_FATAL_EXIT = 4  # listen.py (FATAL_EXIT) says "WS won't recover — fall back to poll"
+# listen.py (FATAL_EXIT) signals "WS impaired — alert + relaunch it", never demote to poll
+LISTEN_FATAL_EXIT = 4
 LISTEN_HEALTHY_RUN_S = 30.0  # a listener run this long counts as a healthy connection that dropped
 LISTEN_MAX_RESTARTS = 5
+LISTEN_ALERT_COOLDOWN_S = 600.0  # throttle impairment pings: at most one per this window
 
 EVENTS_LOG = os.path.expanduser("~/.clidecar/state/gateway-events.jsonl")
 LISTEN_ERR_LOG = os.path.expanduser("~/.clidecar/state/listen-stderr.log")
@@ -347,16 +349,17 @@ def _terminate_child() -> None:
         pass
 
 
-def listen_loop(stop: threading.Event, broker: ex.Broker) -> bool:
+def listen_loop(stop: threading.Event, broker: ex.Broker) -> None:
     """Stream inbound from an adapter that declares `listen` (push): read gate.shape() JSON lines
     from the long-running adapter process and route each through the broker — no polling, no
-    cursor. listen.py handles its own transient reconnects, so an exit is meaningful: a fatal one
-    (token / intent / gave-up) or a crash that keeps recurring. Either way we restart with backoff
-    and re-escalate on repeat, then fall back to REST polling so inbound is never left dead and
-    silent. Returns True to hand off to poll_loop; False only when stopped."""
+    cursor. listen.py handles its own transient reconnects, so an exit is meaningful: an impairment
+    (token / intent / link down past its watchdog) or a crash that keeps recurring. WS-only by
+    John's call: we ALWAYS relaunch the WS with backoff and alert on impairment — never demote to
+    REST polling. Returns only when stopped."""
     global _active_child
     fails = 0
     backoff = 1.0
+    last_alert = 0.0
     while not stop.is_set():
         script, reason = channel.transport()
         if not script:
@@ -427,43 +430,50 @@ def listen_loop(stop: threading.Event, broker: ex.Broker) -> bool:
         if errf:
             errf.close()
         if stop.is_set():
-            return False
+            return
         why = _last_line(LISTEN_ERR_LOG)
+        healthy = delivered or ran >= LISTEN_HEALTHY_RUN_S
+        now = time.monotonic()
+        # A healthy listener never exits while healthy, so the alert throttle is by ELAPSED TIME,
+        # not a "re-armed on healthy exit" flag — else only the first impairment of the process's
+        # life would ever ping. A cooldown re-pings distinct outages and reminds during a long one.
         if code == LISTEN_FATAL_EXIT:
-            log_event("listen_fatal", {"code": code, "stderr": why})
-            alert(
-                f"⚠️ clidecar inbound (WS) fatally unavailable — {why or 'token / MESSAGE_CONTENT intent'}; "
-                "falling back to REST polling."
+            log_event("listen_impaired", {"code": code, "ran_s": round(ran, 1), "stderr": why})
+            if now - last_alert >= LISTEN_ALERT_COOLDOWN_S:
+                alert(
+                    f"⚠️ clidecar inbound (WS) impaired — {why or 'token / MESSAGE_CONTENT intent / outage'}. "
+                    "Retrying the WS; not polling."
+                )
+                last_alert = now
+        elif healthy:
+            fails, backoff = 0, 1.0
+            log_event("listen_exit", {"code": code, "ran_s": round(ran, 1), "stderr": why})
+        else:
+            fails += 1
+            log_event(
+                "listen_exit",
+                {"code": code, "consecutive": fails, "ran_s": round(ran, 1), "stderr": why},
             )
-            return True
-        fails = 0 if (delivered or ran >= LISTEN_HEALTHY_RUN_S) else fails + 1
-        backoff = 1.0 if fails == 0 else backoff
-        log_event(
-            "listen_exit",
-            {"code": code, "consecutive": fails, "ran_s": round(ran, 1), "stderr": why},
-        )
-        sys.stderr.write(
-            f"clidecar gateway: listener exited ({code}) after {ran:.0f}s; restart {fails}\n"
-        )
-        if fails >= LISTEN_MAX_RESTARTS:
-            alert(
-                f"⚠️ clidecar inbound (WS): listener died {fails}x (last exit {code}: {why}) — "
-                "falling back to REST polling."
+            sys.stderr.write(
+                f"clidecar gateway: listener exited ({code}) after {ran:.0f}s; restart {fails}\n"
             )
-            return True
+            if fails >= LISTEN_MAX_RESTARTS and now - last_alert >= LISTEN_ALERT_COOLDOWN_S:
+                alert(
+                    f"⚠️ clidecar inbound (WS): listener crash-looping ({fails}x, last exit {code}: {why}). "
+                    "Retrying the WS; not polling."
+                )
+                last_alert = now
         stop.wait(backoff)
         backoff = min(backoff * 2, 30.0)
-    return False
 
 
 def inbound_loop(stop: threading.Event, broker: ex.Broker) -> None:
-    """Prefer push (`listen`) when the adapter declares it; fall back to REST polling if the
-    listener is fatally unavailable or the adapter only does `poll`."""
-    if bool(channel.capabilities().get("listen")) and listen_loop(stop, broker):
-        if not stop.is_set():
-            log_event("inbound_fallback", {"to": "poll"})
-            poll_loop(stop, broker)
-    elif not bool(channel.capabilities().get("listen")):
+    """Push (`listen`) when the adapter declares it, else REST polling. The listen path is WS-only
+    (John): listen_loop retries the WS and alerts on impairment, never demoting to poll — so poll
+    is reached only by an adapter that can't push at all."""
+    if bool(channel.capabilities().get("listen")):
+        listen_loop(stop, broker)
+    else:
         poll_loop(stop, broker)
 
 

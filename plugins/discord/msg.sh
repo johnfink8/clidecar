@@ -118,10 +118,11 @@ print(d[0]["id"] if d and "id" in d[0] else ((int(time.time()*1000)-142007040000
     printf '%s' "$RESP" | python3 "$(dirname "$0")/history.py"
     ;;
   listen)
-    # Long-running push stream over the Gateway WS. exec so the core's reader gets python's
-    # stdout directly; pass creds explicitly in case the .env didn't export them.
+    # Long-running push stream over the Gateway WS. exec so the core's reader gets python's stdout
+    # directly; pass creds explicitly in case the .env didn't export them. Runs under $PYTHON_BIN
+    # (the venv, sourced from config.env above) so listen.py's `import discord` resolves.
     DISCORD_BOT_TOKEN="$DISCORD_BOT_TOKEN" DISCORD_CHANNEL_ID="$DISCORD_CHANNEL_ID" \
-      exec python3 "$(dirname "$0")/listen.py"
+      exec "${PYTHON_BIN:-python3}" "$(dirname "$0")/listen.py"
     ;;
   *)
     echo "usage: discord-msg.sh send \"text\" [reply_to] | edit <id> \"text\" | react|unreact <id> <emoji> [chan] | fetch [limit]" >&2

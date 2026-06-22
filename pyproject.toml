@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "croniter>=3",
     "holidays>=0.60",
+    "discord.py>=2.4",
 ]
 
 [dependency-groups]

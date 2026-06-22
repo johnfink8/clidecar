@@ -43,6 +43,16 @@
         ]
       }
     ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/john/clidecar/bridge/hook-stopfailure.py"
+          }
+        ]
+      }
+    ],
     "MessageDisplay": [
       {
         "hooks": [

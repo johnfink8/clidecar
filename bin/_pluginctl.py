@@ -13,6 +13,7 @@ Hooks load at session launch, so a change applies on the next `clidecar recycle`
     _pluginctl.py <home> enable  <name>
     _pluginctl.py <home> disable <name>
 """
+
 import json
 import os
 import sys
@@ -85,8 +86,11 @@ def list_plugins(home):
     root = os.path.join(home, "plugins")
     settings = load_json(settings_path(home), {})
     active = json.dumps(settings.get("hooks", {}))
-    names = sorted(d for d in os.listdir(root) if os.path.isfile(os.path.join(root, d, "plugin.json"))) \
-        if os.path.isdir(root) else []
+    names = (
+        sorted(d for d in os.listdir(root) if os.path.isfile(os.path.join(root, d, "plugin.json")))
+        if os.path.isdir(root)
+        else []
+    )
     if not names:
         print("no plugins found in plugins/")
         return

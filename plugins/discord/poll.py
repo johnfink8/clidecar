@@ -5,6 +5,7 @@
 Discord returns it); stdout is one compact JSON line per deliverable message, oldest-first.
 Gating + shaping live in gate.py, shared with the WS listener (listen.py).
 """
+
 import json
 import sys
 

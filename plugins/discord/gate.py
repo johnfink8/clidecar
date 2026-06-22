@@ -7,6 +7,7 @@ security boundary and the line shape live in ONE place. A deliverable line is:
 Gating is the channel's security boundary (drop bots + anyone not in access.json allowFrom, fail
 closed), so it lives here in the Discord-aware adapter, never in the Claude-facing gateway.
 """
+
 import json
 import os
 
@@ -53,11 +54,13 @@ def shape(msg: object, allow: "set[str]") -> "str | None":
         content = f"{content}\n{note}" if content else note
     if not content:
         return None
-    return json.dumps({
-        "id": mid,
-        "chat_id": msg.get("channel_id") if isinstance(msg.get("channel_id"), str) else "",
-        "user": author.get("username") if isinstance(author.get("username"), str) else "",
-        "user_id": user_id,
-        "content": content,
-        "ts": msg.get("timestamp") if isinstance(msg.get("timestamp"), str) else "",
-    })
+    return json.dumps(
+        {
+            "id": mid,
+            "chat_id": msg.get("channel_id") if isinstance(msg.get("channel_id"), str) else "",
+            "user": author.get("username") if isinstance(author.get("username"), str) else "",
+            "user_id": user_id,
+            "content": content,
+            "ts": msg.get("timestamp") if isinstance(msg.get("timestamp"), str) else "",
+        }
+    )

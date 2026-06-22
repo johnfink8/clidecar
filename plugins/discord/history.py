@@ -10,6 +10,7 @@ rendered is the whole point. Each line names its author so untrusted content sta
 stdin: the raw JSON array from GET /channels/{id}/messages (newest-first, as Discord returns it).
 stdout: one readable line per message, oldest-first.
 """
+
 import json
 import sys
 
@@ -29,7 +30,11 @@ def render(msg: object) -> "str | None":
     content = msg.get("content") if isinstance(msg.get("content"), str) else ""
     attachments = msg.get("attachments")
     if isinstance(attachments, list):
-        names = [fn for a in attachments if isinstance(a, dict) and isinstance(fn := a.get("filename"), str)]
+        names = [
+            fn
+            for a in attachments
+            if isinstance(a, dict) and isinstance(fn := a.get("filename"), str)
+        ]
         if names:
             content = f"{content} [attachments: {', '.join(names)}]".strip()
     content = content.replace("\n", " ⏎ ")
@@ -47,7 +52,9 @@ def main() -> int:
         return 1
     lines = [line for msg in reversed(payload) if (line := render(msg))]
     if len(lines) < len(payload):
-        sys.stderr.write(f"discord fetch: dropped {len(payload) - len(lines)} unrenderable message(s)\n")
+        sys.stderr.write(
+            f"discord fetch: dropped {len(payload) - len(lines)} unrenderable message(s)\n"
+        )
     sys.stdout.write("\n".join(lines))
     if lines:
         sys.stdout.write("\n")

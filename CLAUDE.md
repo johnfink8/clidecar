@@ -35,6 +35,9 @@ overview + design in [README.md](README.md).
   via `PYTHON_BIN` in `config.env` (live config) so its deps (croniter, holidays)
   resolve; the hooks + shim stay on portable `#!/usr/bin/env python3` (no venv-only
   imports, and the repo is public — no hardcoded venv paths in committed files).
+  A tracked `.githooks/pre-commit` runs all three (ruff format `--check`, ruff check,
+  pyright) and blocks a dirty commit — activate it per-clone with
+  `git config core.hooksPath .githooks`.
 - **Validate bash before it goes live**: `bash -n bin/sidecar.sh`. A sidecar that
   crashes on start trips systemd StartLimit → `OnFailure` restores `known-good/`.
 - **Test recycles cost a context reset** — checkpoint to `~/.clidecar/state/state.md`

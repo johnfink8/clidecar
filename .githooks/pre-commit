@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Block a commit that isn't formatted, lint-clean, and type-clean.
+# Activate per-clone with: git config core.hooksPath .githooks
+set -uo pipefail
+
+root="$(git rev-parse --show-toplevel)" || exit 1
+cd "$root" || exit 1
+
+fail=0
+run() {
+  local label="$1"; shift
+  if ! "$@"; then
+    echo "pre-commit: $label failed" >&2
+    fail=1
+  fi
+}
+
+run "ruff format" uv run ruff format --check .
+run "ruff check" uv run ruff check .
+run "pyright" uv run pyright
+
+if [ "$fail" -ne 0 ]; then
+  echo "pre-commit: blocked. Fix above (ruff format issues: 'uv run ruff format .') and recommit." >&2
+  exit 1
+fi

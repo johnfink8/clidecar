@@ -14,6 +14,7 @@ import datetime
 import fcntl
 import json
 import os
+import re
 import sys
 from collections.abc import Callable, Generator
 from dataclasses import asdict, dataclass, field
@@ -32,6 +33,8 @@ UNDELIVERED_DIR = os.path.join(STATE_DIR, "undelivered")
 SEEN = "👀"
 DONE = "✅"
 WORKING = "⏳"
+RUNNING = "⏳"  # no tool_result row yet
+FAILED = "⚠️"
 BODY_CAP = 1900  # headroom under Discord's 2000-char message limit
 TOOL_CAP = 120  # tool summaries stay one tidy line; narrations are never capped
 
@@ -46,7 +49,10 @@ DONE_PING = (
 # the real "continued" cue.
 SPILL_FOOTER = "⏬"
 
-# A rendered status line: ("text", narration) kept whole, or ("tool", summary) one-line-capped.
+# A rendered status line, kept whole or capped by kind:
+#   ("text",  narration)  — raw markdown, never truncated
+#   ("tool",  summary)    — one-line-capped, rendered in an inline code span
+#   ("agent", line)       — raw markdown for a subagent block (blockquote header + subtext usage)
 Item = tuple[str, str]
 
 
@@ -146,16 +152,59 @@ def summarize_tool(tool_name: str, tool_input: object) -> str:
     if tool_name in ("Grep", "Glob"):
         pattern = ti.get("pattern") or ti.get("query")
         return f"🔎 {pattern if isinstance(pattern, str) else ''}"
-    if tool_name in ("Task", "Agent"):
-        description = ti.get("description")
-        return f"🤖 {description if isinstance(description, str) else 'subagent'}"
     return f"🔧 {tool_name}"
+
+
+def _tool_status(tuid: str | None, errors: dict[str | None, bool]) -> str:
+    """Derived purely from the transcript, so a PreToolUse render shows ⏳ and the matching
+    PostToolUse render resolves it once the result lands."""
+    if tuid is None or tuid not in errors:
+        return "pending"
+    return "error" if errors[tuid] else "ok"
+
+
+def _agent_items(tool_input: object, status: str, result: str) -> list[Item]:
+    """We can't stream a subagent's inner steps (separate context, no hooks), so start + end +
+    a one-line result is the honest view."""
+    ti = t.as_obj(tool_input)
+    st = ti.get("subagent_type")
+    short = st.split(":")[-1] if isinstance(st, str) and st else "subagent"
+    desc = ti.get("description")
+    desc = desc.strip() if isinstance(desc, str) and desc.strip() else "subagent"
+    if status == "pending":
+        sub = f"-# {RUNNING} running…"
+    elif status == "error":
+        sub = f"-# {FAILED} failed{_agent_usage(result)}"
+    else:
+        sub = f"-# {DONE}{_agent_usage(result)}"
+    return [("agent", f"> 🤖 {short} — {desc}"), ("agent", sub)]
+
+
+def _agent_usage(result: str) -> str:
+    """Reads the <usage> trailer Claude appends to a Task result
+    (tool_uses/subagent_tokens/duration_ms); '' if absent."""
+
+    def grab(key: str) -> int | None:
+        m = re.search(rf"{key}:\s*(\d+)", result)
+        return int(m.group(1)) if m else None
+
+    tools, tok, ms = grab("tool_uses"), grab("subagent_tokens"), grab("duration_ms")
+    parts: list[str] = []
+    if tools is not None:
+        parts.append(f"{tools} tools")
+    if tok is not None:
+        parts.append(f"{tok // 1000}k tok" if tok >= 1000 else f"{tok} tok")
+    if ms is not None:
+        parts.append(f"{round(ms / 1000)}s")
+    return f" {' · '.join(parts)}" if parts else ""
 
 
 def turn_lines(turn: list[t.Row]) -> list[Item]:
     """Narrations are kept WHOLE — they carry intent and reasoning, so they're never
-    truncated; only tool summaries are length-capped (at render). Discord replies are
-    skipped — they're their own visible messages, not work worth a line."""
+    truncated; only tool summaries are length-capped (at render). Discord replies are skipped —
+    they're their own visible messages, not work worth a line."""
+    errors = t.tool_result_errors(turn)
+    contents = t.tool_result_content(turn)
     items: list[Item] = []
     for o in turn:
         for b in t.assistant_blocks(o) or []:
@@ -166,8 +215,20 @@ def turn_lines(turn: list[t.Row]) -> list[Item]:
             elif b.get("type") == "tool_use":
                 name = b.get("name")
                 name = name if isinstance(name, str) else ""
-                if not t.is_discord_reply(name):
-                    items.append(("tool", summarize_tool(name, b.get("input"))))
+                if t.is_discord_reply(name):
+                    continue
+                tuid = b.get("id")
+                tuid = tuid if isinstance(tuid, str) else None
+                status = _tool_status(tuid, errors)
+                if name in ("Task", "Agent"):
+                    items.extend(_agent_items(b.get("input"), status, contents.get(tuid or "", "")))
+                else:
+                    glyph = (
+                        f"{RUNNING} "
+                        if status == "pending"
+                        else (f"{FAILED} " if status == "error" else "")
+                    )
+                    items.append(("tool", f"{glyph}{summarize_tool(name, b.get('input'))}"))
     return items
 
 
@@ -191,8 +252,8 @@ def split_units(items: list[Item]) -> list[Item]:
     transition (the basis for append-only streaming)."""
     units: list[Item] = []
     for kind, text in items:
-        if kind == "text":
-            units.extend(("text", ln) for ln in text.split("\n"))
+        if kind in ("text", "agent"):
+            units.extend((kind, ln) for ln in text.split("\n"))
         else:
             units.append((kind, text))
     return units
@@ -224,7 +285,7 @@ def live_text(live: LiveState | None) -> str:
 
 def _line(item: Item) -> str:
     kind, text = item
-    return text if kind == "text" else f"`{text[:TOOL_CAP]}`"
+    return f"`{text[:TOOL_CAP]}`" if kind == "tool" else text
 
 
 def fence_state(items: list[Item]) -> str | None:

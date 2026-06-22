@@ -20,6 +20,15 @@
             "timeout": 600
           }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/john/clidecar/bridge/hook-progress.py"
+          }
+        ]
       }
     ],
     "PostToolUse": [

@@ -88,4 +88,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # This now runs on PreToolUse — a nonzero exit there can DENY the tool. Progress is
+        # best-effort, so swallow any render-path crash and exit clean; never block a real call.
+        h.log_event("progress_crash", {"error": repr(e)})
+        sys.exit(0)

@@ -155,6 +155,29 @@ def tool_result_errors(turn: list[Row]) -> dict[str | None, bool]:
     return errors
 
 
+def tool_result_content(turn: list[Row]) -> dict[str, str]:
+    """Map tool_use_id -> the tool_result's text for the turn. Content is a string or a list of
+    blocks (per the wire format); both flatten to text. Used to read a subagent's usage trailer."""
+    out: dict[str, str] = {}
+    for o in turn:
+        content = as_obj(o.get("message")).get("content")
+        for b in as_list(content):
+            blk = as_obj(b)
+            if blk.get("type") != "tool_result":
+                continue
+            tuid = blk.get("tool_use_id")
+            if not isinstance(tuid, str):
+                continue
+            c = blk.get("content")
+            if isinstance(c, str):
+                out[tuid] = c
+                continue
+            parts = [txt for x in as_list(c) if isinstance(txt := as_obj(x).get("text"), str)]
+            if parts:
+                out[tuid] = " ".join(parts)
+    return out
+
+
 def extract_closing(turn: list[Row]) -> tuple[str, bool]:
     """Return (closing_text, already_sent) for the turn.
 

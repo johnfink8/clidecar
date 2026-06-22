@@ -134,8 +134,39 @@ confirm_dev_channel() {
   return 1
 }
 
+# Network-readiness gate, geometric backoff capped at 1h.
+#
+# The unit's After=/Wants=network-online.target is a NO-OP for a --user service
+# (that target is passive in the user manager — nothing activates it), so on a
+# cold boot the sidecar can start before the network is up. Claude then spawns
+# its MCP server children (quorelo, gmail, …) before DNS/API are reachable;
+# those connects fail and CC does NOT retry them, leaving the session amnesiac
+# until the next recycle. So block each Claude launch until the Anthropic API
+# actually answers. (The gateway daemon is not gated here — it owns WS
+# reconnect/backoff and self-heals a down network on its own.)
+#
+# Backoff doubles 5s→1h so a long outage (e.g. ISP still down after a power cut)
+# is waited out patiently, not hammered. Discord can't be notified during the
+# wait — that needs the very network we're waiting on — so the retry log lines
+# (`clidecar logs`) are the loud signal.
+wait_for_network() {
+  command -v curl >/dev/null 2>&1 || { log "curl missing — skipping network gate"; return 0; }
+  local url="${NET_PROBE_URL:-https://api.anthropic.com/}" delay=5 max=3600 waited=0
+  # No -f on purpose: any HTTP response (even 404/401) proves DNS+TLS+reach; curl
+  # only errors (resolve/connect/timeout) when the network is genuinely down.
+  while ! curl -sS -o /dev/null --max-time 5 "$url" >/dev/null 2>&1; do
+    log "network unreachable ($url) — retry in ${delay}s (waited ${waited}s total)"
+    sleep "$delay"
+    waited=$((waited + delay))
+    delay=$((delay * 2)); [ "$delay" -gt "$max" ] && delay="$max"
+  done
+  [ "$waited" -gt 0 ] && log "network reachable after ${waited}s"
+  return 0
+}
+
 launch_claude() {
   load_config
+  wait_for_network
   # clear any stale screen session of the same name, then start fresh
   screen -S "$SCREEN_NAME" -X quit >/dev/null 2>&1 || true
   rm -f "$PIDFILE"

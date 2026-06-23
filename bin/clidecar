@@ -37,12 +37,19 @@ case "$cmd" in
     if ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
       echo "clidecar set: invalid key '$key' (must be a shell identifier)" >&2; exit 1
     fi
-    # Escape for a double-quoted shell value: backslash and double-quote only, so
-    # the value round-trips literally while $HOME-style expansion still works
-    # (config.env's contract — see config.env.example). Written with printf into a
-    # rewritten file, never sed, so | & " and newlines can't corrupt config.env
-    # the way the old sed `|`-delimiter substitution did.
-    esc="${val//\\/\\\\}"; esc="${esc//\"/\\\"}"
+    # Escape for a double-quoted shell value: backslash, double-quote, and BACKTICK,
+    # so the value round-trips literally while $HOME-style expansion still works
+    # (config.env's contract — see config.env.example). Backticks are load-bearing:
+    # config.env is sourced (sidecar.sh AND plugins/discord/msg.sh), so an unescaped
+    # backtick command-substitutes on every source — a STARTUP_PROMPT containing
+    # `clidecar gateway reload` once ran it in a loop and crash-bombed the supervisor.
+    # $(...) still substitutes via the intentionally-live $; reject it below.
+    # Written with printf into a rewritten file, never sed, so | & " and newlines
+    # can't corrupt config.env the way the old sed `|`-delimiter substitution did.
+    if [[ "$val" == *'$('* ]]; then
+      echo "clidecar set: value contains \$( command substitution; refusing (use a literal value)" >&2; exit 1
+    fi
+    esc="${val//\\/\\\\}"; esc="${esc//\"/\\\"}"; esc="${esc//\`/\\\`}"
     tmp="$(mktemp "${CONFIG_FILE}.XXXXXX")" || { echo "clidecar set: mktemp failed" >&2; exit 1; }
     # Each write is checked before the atomic mv — a failed/partial rewrite must
     # NOT clobber the good config or report success (no set -e here, so rc must be

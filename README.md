@@ -137,15 +137,17 @@ intact and a reply is never lost to a console you aren't watching.
 
 **Strict lanes:** the hooks and the daemon talk only to the gateway; only the
 channel *adapter* talks to the messaging app. An adapter under `plugins/<name>/`
-is a dumb transport that knows nothing about Claude — a `plugin.json` manifest
-declaring `kind: "messaging"`, its transport script, and its `capabilities`, plus
-the script itself. The gateway resolves the active adapter at runtime (`CHANNEL`
-in `config.env`, else the sole installed messaging plugin) and degrades around any
-capability the channel doesn't declare. `plugins/discord/` is the bundled adapter.
+is a transport that knows nothing about Claude — a `plugin.json` manifest declaring
+`kind: "messaging"`, a `client` entrypoint (`module:Class`), and its `capabilities`,
+plus a Python client class the daemon imports and drives (one persistent connection
+for both inbound and outbound). The gateway resolves the active adapter at runtime
+(`CHANNEL` in `config.env`, else the sole installed messaging plugin) and degrades
+around any capability the channel doesn't declare. `plugins/discord/` is the bundled
+adapter (a discord.py client).
 
-Editing a hook or adapter script takes effect immediately; changing the gateway
-daemon core needs `clidecar gateway reload`, and changing which hooks are
-registered in `.claude/settings.json` needs a recycle.
+Editing a hook script takes effect immediately; changing the gateway daemon core —
+including the in-process adapter client — needs `clidecar gateway reload`, and changing
+which hooks are registered in `.claude/settings.json` needs a recycle.
 
 ## Remote control (optional)
 

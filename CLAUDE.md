@@ -16,19 +16,24 @@ overview + design in [README.md](README.md).
   untouched (`KillMode=process`). This bit us on the first dogfood recycle.
 - **`config.env` changes ARE picked up live** — `launch_claude` re-sources it on
   every (re)launch. Only sidecar *code* changes need a reload.
-- **Hook/plugin script edits are LIVE immediately; only `settings.json` registration
-  needs a recycle.** Claude Code re-executes a command-hook's script file on every
-  invocation, so editing a plugin's `*.py`/`*.sh` takes effect mid-session. But *which*
-  hooks are registered (`.claude/settings.json`) loads once at launch — so
-  `clidecar plugin enable/disable` (and moving hook files) needs a `clidecar recycle`
-  to take effect. (Distinct from `bin/sidecar.sh`, which needs `clidecar reload`.)
-- **Gateway daemon CORE edits (`bridge/gateway.py`, `exchange.py`) need
-  `clidecar gateway reload`** — the running daemon parsed them at start. The hook
-  scripts that talk to it are still live-on-save (above); only the daemon process
-  itself must be restarted. ⚠️ KNOWN GAP: `gateway reload` restarts the daemon with a
-  fresh broker socket, but the live session's shim stays attached to the OLD socket
-  and does NOT auto-reconnect — so a reload strands inbound until the next recycle
-  reattaches a fresh shim. Reload the daemon, then recycle (or schedule it).
+- **Hook script edits are LIVE immediately; only `settings.json` registration
+  needs a recycle.** Claude Code re-executes a command-hook's script file (`bridge/hook-*.py`)
+  on every invocation, so editing one takes effect mid-session. But *which* hooks are registered
+  (`.claude/settings.json`) loads once at launch — so `clidecar plugin enable/disable` (and moving
+  hook files) needs a `clidecar recycle` to take effect. (Distinct from `bin/sidecar.sh`, which
+  needs `clidecar reload`.) NOTE: the messaging ADAPTER is no longer live-on-save — it's now an
+  in-process client imported INTO the daemon (next bullet), so adapter edits need a `gateway reload`.
+- **Gateway daemon CORE edits (`bridge/gateway.py`, `exchange.py`, `channel.py`, and the active
+  adapter client `plugins/<name>/client.py` + what it imports — `gate.py`/`history.py`/`_message.py`)
+  need `clidecar gateway reload`** — the running daemon imported them at start. The hook scripts that
+  talk to it are still live-on-save (above); only the daemon process itself must be restarted. The new daemon serves a fresh broker socket and the live
+  session's shim can't reconnect a stdio server mid-session, so `gateway reload` now
+  ALSO recycles Claude (supervisor-side) so a fresh shim attaches to the new socket —
+  but only AFTER polling that the new daemon actually came up. If it didn't (e.g. the
+  core edit you just made won't boot), the supervisor SKIPS the recycle, keeps the live
+  session, and pings Discord — better a preserved session than a context reset burned
+  into a dead socket. ⚠️ A successful reload costs a context reset: checkpoint to
+  state.md + memory FIRST, same as `recycle`.
 - **The bridge is a uv project** (`pyproject.toml` + `uv.lock`, `.venv` via `uv sync`).
   Run tooling through it: `uv run ruff format` / `uv run ruff check` / `uv run pyright`
   (strict, 0 errors expected). The gateway daemon launches under the venv interpreter
@@ -61,29 +66,37 @@ overview + design in [README.md](README.md).
   strict** (config in `pyproject.toml`); every JSON boundary validated via each
   dataclass's `from_obj` builder. Two halves:
   - **Gateway daemon** — `gateway.py` is the persistent process (supervised, survives
-    recycles): owns the messaging-channel connection (WS push via the adapter's `listen`)
-    + inbound routing + the single outbound funnel. `exchange.py` =
-    the unix-socket Broker (routes each inbound to EXACTLY ONE sink — open claim → attached
-    Claude → else ❌; emit/edit/react/latest with retries + dedup; `emit` returns the msg id)
-    plus its client helpers + `ask()` (cross-process request→reply). `gateway-shim.py` = the
-    disposable per-launch MCP-stdio shim Claude Code spawns to attach to the daemon socket.
+    recycles): imports the active adapter's in-process client (via `channel.client_entrypoint()`)
+    and drives it for inbound + outbound. `_transport` bridges the daemon's sync threads to the
+    client's asyncio loop (`run_coroutine_threadsafe`); inbound flows back through a non-blocking
+    `on_inbound` that hands each line to a worker pool. **No-deadlock rule: `route_inbound` must
+    never run on the client's loop thread** (it re-enters outbound for the ❌ no-Claude react).
+    `exchange.py` = the unix-socket Broker (routes each inbound to EXACTLY ONE sink — open claim →
+    attached Claude → else ❌; emit/edit/react/latest with retries + dedup; `emit` returns the msg
+    id) plus its client helpers + `ask()` (cross-process request→reply) — transport-agnostic, takes
+    `_transport` by injection, unchanged by the client swap. `gateway-shim.py` = the disposable
+    per-launch MCP-stdio shim Claude Code spawns to attach to the daemon socket.
   - **Output + question hooks** — `hook-{ack,progress,final}.py` = UserPromptSubmit /
     PostToolUse+MessageDisplay / Stop (👀 ack, live status mirror, deterministic Stop-hook
     final answer); `hook-question.py` = the AskUserQuestion PreToolUse hook (renders options
     to the channel + BLOCKS for the answer via `exchange.ask`, degrades to deny-render).
     `_hooklib.py` = shared per-turn state + rendering + the `channel_*` broker clients;
     `transcript.py` = transcript-JSONL parsing; `channel.py` = resolves the active adapter →
-    transport + capabilities. Registered directly in `.claude/settings.json` (core, not a
-    toggle-able plugin). STRICT LANES: hooks talk only to the gateway, never the adapter.
-- `plugins/<name>/` — messaging-channel ADAPTERS: a dumb transport that knows nothing about
-  Claude. A `plugin.json` manifest (`{kind:"messaging", transport, capabilities}`) + a
-  transport script. `plugins/discord/`: `msg.sh` (send/edit/react/latest/fetch via the bot
-  API) + `listen.py` (discord.py Gateway WS streamer = inbound push) + `gate.py` (inbound
-  gate+shape: drop bots + non-allowlisted, fail-closed) + `history.py` (channel read-back).
-  The gateway picks the adapter at runtime —
-  `config.env` `CHANNEL`, else the sole installed messaging plugin — and degrades around any
-  capability it doesn't declare. **Writing a new adapter: [plugins/README.md](plugins/README.md)** —
-  the full manifest + verb + inbound-line-shape contract, no reverse-engineering needed.
+    client entrypoint + capabilities, and declares the `ChannelClient` Protocol. Registered directly
+    in `.claude/settings.json` (core, not a toggle-able plugin). STRICT LANES: hooks talk only to
+    the gateway, never the adapter.
+- `plugins/<name>/` — messaging-channel ADAPTERS: an in-process client that owns the provider
+  connection (inbound + outbound) and knows nothing about Claude. A `plugin.json` manifest
+  (`{kind:"messaging", client:"module:Class", capabilities}`) + a Python module exposing a class
+  satisfying `channel.ChannelClient` (`loop`/`start`/`dispatch(verb,*args)->(code,stdout)`/`shutdown`/
+  `fatal`). `plugins/discord/`: `client.py` (one persistent discord.py client — `on_message` inbound
+  + `dispatch` send/edit/react/latest/fetch; discord.py owns reconnect + 429 backoff) + `gate.py`
+  (inbound gate+shape: drop bots + non-allowlisted, fail-closed) + `history.py` (fetch read-back
+  render) + `_message.py` (pydantic wire shape). The daemon imports the client under its venv
+  (`PYTHON_BIN`), so the adapter may use venv deps; it picks the adapter at runtime — `config.env`
+  `CHANNEL`, else the sole installed messaging plugin — and degrades around any capability it
+  doesn't declare. **Writing a new adapter: [plugins/README.md](plugins/README.md)** — the full
+  manifest + ChannelClient + inbound-line-shape contract, no reverse-engineering needed.
 - `systemd/` — the supervisor unit + the OnFailure unit.
 - `pyproject.toml` — uv project: runtime deps (croniter, holidays) + dev tooling (ruff,
   pyright) + their config. `uv sync` builds `.venv`; the daemon runs under it via `PYTHON_BIN`.

@@ -219,6 +219,26 @@ guard_relaunch() {
   fi
 }
 
+# Same bound for the gateway daemon. It exits non-zero on an unrecoverable client (bad token,
+# missing intent, link down past its watchdog) so the supervisor relaunches it — which means a
+# persistent fault would tight-loop relaunches. This caps that and alerts.
+GATEWAY_LAUNCH_TIMES=()
+guard_gateway_relaunch() {
+  load_config
+  local now kept=() t
+  now=$(date +%s)
+  GATEWAY_LAUNCH_TIMES+=("$now")
+  for t in "${GATEWAY_LAUNCH_TIMES[@]}"; do [ $((now - t)) -le "$WINDOW_SECS" ] && kept+=("$t"); done
+  GATEWAY_LAUNCH_TIMES=("${kept[@]}")
+  if [ "${#GATEWAY_LAUNCH_TIMES[@]}" -gt "$MAX_RELAUNCHES" ]; then
+    log "gateway crash-loop: ${#GATEWAY_LAUNCH_TIMES[@]} relaunches in ${WINDOW_SECS}s — pausing ${PAUSE_SECS}s"
+    "$CLIDECAR_HOME/bin/notify-discord.sh" \
+      "⚠️ clidecar gateway daemon is crash-looping (${#GATEWAY_LAUNCH_TIMES[@]} relaunches/${WINDOW_SECS}s) — inbound is DOWN. Check \`clidecar gateway logs\`. Pausing ${PAUSE_SECS}s." || true
+    sleep "$PAUSE_SECS"
+    GATEWAY_LAUNCH_TIMES=()
+  fi
+}
+
 wait_for_event() {
   load_config
   if command -v inotifywait >/dev/null 2>&1; then
@@ -252,7 +272,32 @@ while true; do
     rm -f "$CONTROL_DIR/GATEWAY_RELOAD"
     log "GATEWAY_RELOAD requested"
     stop_gateway
-    launch_gateway         # restart the daemon WITHOUT recycling Claude's context
+    launch_gateway
+    # The new daemon serves a fresh broker socket, but the live session's MCP
+    # stdio shim stays bound to the OLD socket and CC can't reconnect a stdio
+    # server mid-session — so a bare daemon restart strands inbound. Recycle
+    # Claude so its fresh shim attaches to the new socket. BUT gate the recycle
+    # on the daemon actually serving: `gateway reload` runs right after a
+    # gateway-core edit, so a daemon that won't boot is the LIKELY case, and
+    # recycling into a dead socket is strictly worse than the old gap — it burns
+    # the context reset too. launch_gateway returns 0 unconditionally, so poll
+    # gateway_alive (real liveness + cmdline check) before committing the recycle.
+    gw_up=0
+    for _ in $(seq 1 "${GATEWAY_READY_SECS:-10}"); do
+      if gateway_alive; then gw_up=1; break; fi
+      sleep 1
+    done
+    if [ "$gw_up" = 1 ]; then
+      log "gateway up after reload — recycling claude to reattach its shim to the new socket"
+      graceful_kill
+      launch_claude
+    else
+      # Keep the (healthy, checkpointable) live session rather than recycle it
+      # blind. Notify via the bot-API pinger — it doesn't depend on the gateway.
+      log "gateway did NOT come up after reload — NOT recycling claude (live session preserved)"
+      "$CLIDECAR_HOME/bin/notify-discord.sh" \
+        "⚠️ gateway reload: daemon failed to restart — NOT recycling. Live session preserved but inbound is stranded (no daemon). Check \`clidecar gateway logs\`, fix bridge/gateway.py, then reload again." || true
+    fi
     continue
   fi
   if [ -e "$CONTROL_DIR/RECYCLE" ]; then
@@ -264,6 +309,7 @@ while true; do
   fi
   if gateway_enabled && ! gateway_alive; then
     log "gateway not alive — relaunching"
+    guard_gateway_relaunch
     launch_gateway
   fi
   if ! claude_alive; then

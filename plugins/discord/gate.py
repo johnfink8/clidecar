@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Gate + shape one raw Discord message into a deliverable inbound line for the clidecar gateway.
 
-Used by the inbound listen path (listen.py, the Gateway WS stream), so the security boundary and
+Used by the client's inbound path (on_message, the Gateway WS stream), so the security boundary and
 the line shape live in ONE place. A deliverable line is:
   {"id","chat_id","user","user_id","content","ts"}
 Gating is the channel's security boundary (drop bots + anyone not in access.json allowFrom, fail
@@ -10,45 +10,54 @@ closed), so it lives here in the Discord-aware adapter, never in the Claude-faci
 
 import json
 import os
+import sys
+
+from _message import Message
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 ACCESS_FILE = os.path.expanduser("~/.claude/channels/discord/access.json")
 
 
+class _Access(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    allowFrom: list[str] = []  # noqa: N815 — mirrors the access.json key the /discord:access skill writes
+
+
 def allowed_senders() -> set[str]:
     """A missing/broken access file means nothing is allowed — fail closed: an open inbound
-    channel is a prompt-injection vector."""
+    channel is a prompt-injection vector. A missing file is a fresh-setup state (silent); a
+    present-but-unparseable one is a config error that silently drops ALL inbound, so say so."""
     try:
         with open(ACCESS_FILE, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
+            raw = fh.read()
+    except OSError:
         return set()
-    allow = data.get("allowFrom") if isinstance(data, dict) else None
-    return {s for s in allow if isinstance(s, str)} if isinstance(allow, list) else set()
+    try:
+        access = _Access.model_validate_json(raw)
+    except ValidationError as e:
+        sys.stderr.write(
+            f"discord gate: access.json present but unparseable — allowing NOBODY: {e}\n"
+        )
+        return set()
+    return set(access.allowFrom)
 
 
-def shape(msg: object, allow: "set[str]") -> "str | None":
+def shape(raw: object, allow: "set[str]") -> "str | None":
     """Attachment-only messages are annotated rather than dropped, so the user learns they didn't
-    come through. Returns None to drop (bot, not allow-listed, no id, or no deliverable content)."""
-    if not isinstance(msg, dict):
+    come through. Returns None to drop (unparseable, bot, not allow-listed, or no deliverable
+    content). A message that won't validate is dropped, not raised — one malformed frame must not
+    fell the inbound loop, and fail-closed is the safe default for the security boundary."""
+    try:
+        msg = Message.model_validate(raw)
+    except ValidationError as e:
+        # Real Discord frames always validate, so a failure here is wire-shape drift, not a normal
+        # drop (bots/non-allowlisted never reach this) — surface it without breaking fail-closed.
+        sys.stderr.write(f"discord gate: dropped an unparseable inbound frame: {e}\n")
         return None
-    author = msg.get("author")
-    author = author if isinstance(author, dict) else {}
-    if author.get("bot"):
+    if msg.author.bot or msg.author.id not in allow:
         return None
-    user_id = author.get("id")
-    if not isinstance(user_id, str) or user_id not in allow:
-        return None
-    mid = msg.get("id")
-    if not isinstance(mid, str):
-        return None
-    content = msg.get("content") if isinstance(msg.get("content"), str) else ""
-    attachments = msg.get("attachments")
-    names: list[str] = []
-    if isinstance(attachments, list):
-        for a in attachments:
-            fn = a.get("filename") if isinstance(a, dict) else None
-            if isinstance(fn, str):
-                names.append(fn)
+    names = [a.filename for a in msg.attachments if a.filename]
+    content = msg.content
     if names:
         note = f"[{', '.join(names)} — attachments aren't supported on this channel yet]"
         content = f"{content}\n{note}" if content else note
@@ -56,11 +65,11 @@ def shape(msg: object, allow: "set[str]") -> "str | None":
         return None
     return json.dumps(
         {
-            "id": mid,
-            "chat_id": msg.get("channel_id") if isinstance(msg.get("channel_id"), str) else "",
-            "user": author.get("username") if isinstance(author.get("username"), str) else "",
-            "user_id": user_id,
+            "id": msg.id,
+            "chat_id": msg.channel_id,
+            "user": msg.author.username,
+            "user_id": msg.author.id,
             "content": content,
-            "ts": msg.get("timestamp") if isinstance(msg.get("timestamp"), str) else "",
+            "ts": msg.timestamp,
         }
     )

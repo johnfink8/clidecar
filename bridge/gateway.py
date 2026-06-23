@@ -12,8 +12,15 @@ MCP for exactly one Claude and dies with it.
 The Broker (bridge/exchange.py) is the transport mediator: it serves the socket, hands this module's
 handle_request() each MCP request (and writes back the response), and routes every inbound message to
 exactly one sink — an open Exchange claim, else the attached Claude as a _channel_frame(), else a ❌
-react (honest non-delivery when nobody is home). The app connection itself stays a dumb
-`plugins/<name>/` adapter resolved at runtime via channel.transport().
+react (honest non-delivery when nobody is home). The provider connection is an in-process adapter
+client resolved at runtime via channel.client_entrypoint() (e.g. plugins/discord/client.py) that owns
+both inbound and outbound; this module never names a provider.
+
+Threading: this daemon is synchronous/thread-based; the adapter client runs discord.py on its own
+asyncio loop. The `_outbound` shim bridges sync→async via run_coroutine_threadsafe. Inbound flows
+back through the client's on_inbound callback, which here only SUBMITS to a worker pool and returns —
+so the client's event loop is never blocked and route_inbound's re-entrant outbound (the ❌ react)
+can never deadlock against the loop. The one rule: route_inbound must never run on the loop thread.
 
 Wire contract (verified against the official discord channel server):
   inbound  -> {"jsonrpc":"2.0","method":"notifications/claude/channel",
@@ -21,6 +28,8 @@ Wire contract (verified against the official discord channel server):
   outbound <- standard MCP tools/list + tools/call for reply/react/edit_message
 """
 
+import asyncio
+import importlib
 import json
 import os
 import signal
@@ -28,26 +37,26 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from typing import cast
 
 import channel
 import exchange as ex
+from channel import ChannelClient
 
 SERVER_NAME = "clidecar"
 SERVER_VERSION = "0.1.0"
 PROTOCOL_FALLBACK = "2024-11-05"
 TRANSPORT_TIMEOUT_S = (
-    30.0  # bound each adapter shell-out so a hung/429-sleeping call can't wedge us
+    30.0  # bound each outbound dispatch so a hung/rate-limited call can't wedge us
 )
-# listen.py (FATAL_EXIT) signals "WS impaired — alert + relaunch it"
-LISTEN_FATAL_EXIT = 4
-LISTEN_HEALTHY_RUN_S = 30.0  # a listener run this long counts as a healthy connection that dropped
-LISTEN_MAX_RESTARTS = 5
-LISTEN_ALERT_COOLDOWN_S = 600.0  # throttle impairment pings: at most one per this window
-LISTEN_FAIL_ALERT_AFTER = 5  # alert after this many consecutive channel-unresolved failures
+# The adapter client signals an unrecoverable connection (bad token, missing intent, link down past
+# its watchdog); the daemon alerts and exits this code so the supervisor relaunches it.
+CLIENT_FATAL_EXIT = 4
 
 EVENTS_LOG = os.path.expanduser("~/.clidecar/state/gateway-events.jsonl")
-LISTEN_ERR_LOG = os.path.expanduser("~/.clidecar/state/listen-stderr.log")
 NOTIFY = os.path.expanduser("~/clidecar/bin/notify-discord.sh")
 
 
@@ -88,26 +97,31 @@ def _error(req_id: object, code: int, message: str) -> "dict[str, object]":
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
-def _transport(*args: str) -> "tuple[int, str]":
-    """The single shell-out point — same resolution the outbound hooks use, so the gateway never
-    names a transport. Timeout-bounded so a hung or rate-limit-sleeping adapter call can't wedge
-    the caller."""
-    script, reason = channel.transport()
-    if not script:
-        sys.stderr.write(f"clidecar gateway: no channel resolved — {reason}\n")
+_active_client: "ChannelClient | None" = None  # the active adapter client; set once in main()
+
+
+def _outbound(*args: str) -> "tuple[int, str]":
+    """The single outbound point — schedule the verb on the adapter client's asyncio loop and block
+    for the (returncode, stdout) result. Timeout-bounded so a hung or rate-limited call can't wedge
+    the caller. MUST NOT be called from the client's loop thread (it blocks) — only from broker
+    handler threads, the inbound worker pool, or the attached Claude's channel thread."""
+    client = _active_client
+    if client is None or not args:
+        sys.stderr.write("clidecar gateway: no adapter client / empty call\n")
         return 1, ""
+    loop = cast("asyncio.AbstractEventLoop", client.loop)
+    fut = asyncio.run_coroutine_threadsafe(client.dispatch(args[0], *args[1:]), loop)
     try:
-        out = subprocess.run(
-            [script, *args], capture_output=True, text=True, timeout=TRANSPORT_TIMEOUT_S
-        )
-    except subprocess.TimeoutExpired:
+        return fut.result(timeout=TRANSPORT_TIMEOUT_S)
+    except FutureTimeout:
+        fut.cancel()
         sys.stderr.write(
-            f"clidecar gateway: adapter {args[0] if args else '?'!r} timed out after {TRANSPORT_TIMEOUT_S}s\n"
+            f"clidecar gateway: outbound {args[0]!r} timed out after {TRANSPORT_TIMEOUT_S}s\n"
         )
         return 124, ""
-    if out.returncode != 0:
-        sys.stderr.write(out.stderr)
-    return out.returncode, out.stdout
+    except Exception as e:
+        sys.stderr.write(f"clidecar gateway: outbound {args[0]!r} errored: {e!r}\n")
+        return 1, ""
 
 
 TOOLS: "list[dict[str, object]]" = [
@@ -180,7 +194,7 @@ def call_tool(name: str, args: "dict[str, object]") -> "tuple[str, bool]":
             return "clidecar_reply requires chat_id and text", True
         reply_to = _str_arg(args, "reply_to")
         send_args = ["send", text] + ([reply_to] if reply_to else [])
-        code, out = _transport(*send_args)
+        code, out = _outbound(*send_args)
         return (f"sent (id: {out.strip()})", False) if code == 0 else ("reply failed", True)
     if name == "clidecar_react":
         chat_id, mid, emoji = (
@@ -190,13 +204,13 @@ def call_tool(name: str, args: "dict[str, object]") -> "tuple[str, bool]":
         )
         if mid is None or emoji is None:
             return "clidecar_react requires message_id and emoji", True
-        code, _ = _transport("react", mid, emoji)
+        code, _ = _outbound("react", mid, emoji)
         return ("reacted", False) if code == 0 else ("react failed", True)
     if name == "clidecar_edit":
         mid, text = _str_arg(args, "message_id"), _str_arg(args, "text")
         if mid is None or text is None:
             return "clidecar_edit requires message_id and text", True
-        code, _ = _transport("edit", mid, text)
+        code, _ = _outbound("edit", mid, text)
         return ("edited", False) if code == 0 else ("edit failed", True)
     if name == "clidecar_fetch":
         limit = args.get("limit")
@@ -205,7 +219,7 @@ def call_tool(name: str, args: "dict[str, object]") -> "tuple[str, bool]":
             if isinstance(limit, int) and not isinstance(limit, bool) and 1 <= limit <= 100
             else 25
         )
-        code, out = _transport("fetch", str(n))
+        code, out = _outbound("fetch", str(n))
         if code != 0:
             return "fetch failed", True
         return (out if out.strip() else "(no messages)"), False
@@ -231,170 +245,53 @@ def _channel_frame(msg: ex.Inbound) -> "dict[str, object]":
     }
 
 
-_active_child: "subprocess.Popen[str] | None" = None
-_child_lock = threading.Lock()
+_INBOUND_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="inbound")
 
 
-def _last_line(path: str) -> str:
-    """Last non-blank line of the listener's stderr file — the actual failure reason to surface."""
+def _route_line(line: str, broker: ex.Broker) -> None:
+    """Parse one gate-shaped inbound line and route it through the broker. Runs on a worker thread —
+    NEVER the client's loop thread — so route_inbound's re-entrant outbound (the ❌ no-Claude react)
+    can't deadlock against the loop. Same parse/route/log path the old listen_loop had."""
     try:
-        with open(path, encoding="utf-8") as fh:
-            lines = [ln.strip() for ln in fh if ln.strip()]
-    except OSError:
-        return ""
-    return lines[-1] if lines else ""
-
-
-def _terminate_child() -> None:
-    """Kill the listener subprocess on shutdown so a recycle doesn't orphan a live WS connection.
-    Waits (then SIGKILLs) so the socket is torn down before we exit — no momentary double-connect."""
-    with _child_lock:
-        proc = _active_child
-    if not proc or proc.poll() is not None:
+        parsed = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(parsed, dict):
+        return
+    obj = cast("dict[str, object]", parsed)
+    mid = obj.get("id")
+    if not isinstance(mid, str):
+        log_event("inbound_drop_no_id", {"msg": obj})
+        return
+    inb = ex.Inbound.from_obj(obj)
+    if inb is None:
+        log_event("inbound_drop_malformed", {"msg": obj})
         return
     try:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-    except OSError:
-        pass
-
-
-def listen_loop(stop: threading.Event, broker: ex.Broker) -> None:
-    """Stream inbound from the adapter's `listen` (WS push) — the sole inbound path. Read
-    gate.shape() JSON lines from the long-running adapter process and route each through the broker
-    as it arrives. listen.py handles its own transient reconnects, so an exit is meaningful: an
-    impairment (token / intent / link down past its watchdog) or a crash that keeps recurring. We
-    ALWAYS relaunch the WS with backoff and alert on impairment. Returns only when stopped."""
-    global _active_child
-    fails = 0
-    backoff = 1.0
-    last_alert = 0.0
-    while not stop.is_set():
-        script, reason = channel.transport()
-        if not script:
-            fails += 1
-            log_event(
-                "listen_error", {"error": f"unresolved channel: {reason}", "consecutive": fails}
-            )
-            if fails % LISTEN_FAIL_ALERT_AFTER == 0:
-                alert(f"⚠️ clidecar inbound: channel unresolved — {reason}")
-            stop.wait(backoff)
-            backoff = min(backoff * 2, 30.0)
-            continue
-        errf = None
-        try:
-            errf = open(LISTEN_ERR_LOG, "w", encoding="utf-8")
-        except OSError:
-            pass
-        started = time.monotonic()
-        try:
-            proc = subprocess.Popen(
-                [script, "listen"], stdout=subprocess.PIPE, stderr=errf, text=True
-            )
-        except OSError as e:
-            if errf:
-                errf.close()
-            fails += 1
-            log_event("listen_error", {"error": repr(e), "consecutive": fails})
-            stop.wait(backoff)
-            backoff = min(backoff * 2, 30.0)
-            continue
-        with _child_lock:
-            _active_child = proc
-        log_event("listen_start", {})
-        delivered = False
-        if proc.stdout is not None:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    parsed = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(parsed, dict):
-                    continue
-                obj = cast("dict[str, object]", parsed)
-                mid = obj.get("id")
-                if not isinstance(mid, str):
-                    log_event("listen_drop_no_id", {"msg": obj})
-                    continue
-                inb = ex.Inbound.from_obj(obj)
-                if inb is None:
-                    log_event("listen_drop_malformed", {"msg": obj})
-                    continue
-                try:
-                    outcome = broker.route_inbound(inb)
-                except (
-                    Exception
-                ) as e:  # one bad delivery must not fell the (otherwise silent) listener
-                    log_event("route_error", {"message_id": mid, "via": "listen", "error": repr(e)})
-                    continue
-                log_event("delivered", {"message_id": mid, "via": "listen", "to": outcome})
-                delivered = True
-        code = proc.wait()
-        ran = time.monotonic() - started
-        with _child_lock:
-            _active_child = None
-        if errf:
-            errf.close()
-        if stop.is_set():
-            return
-        why = _last_line(LISTEN_ERR_LOG)
-        healthy = delivered or ran >= LISTEN_HEALTHY_RUN_S
-        now = time.monotonic()
-        # A healthy listener never exits while healthy, so the alert throttle is by ELAPSED TIME,
-        # not a "re-armed on healthy exit" flag — else only the first impairment of the process's
-        # life would ever ping. A cooldown re-pings distinct outages and reminds during a long one.
-        if code == LISTEN_FATAL_EXIT:
-            log_event("listen_impaired", {"code": code, "ran_s": round(ran, 1), "stderr": why})
-            if now - last_alert >= LISTEN_ALERT_COOLDOWN_S:
-                alert(
-                    f"⚠️ clidecar inbound (WS) impaired — {why or 'token / MESSAGE_CONTENT intent / outage'}. "
-                    "Retrying the WS."
-                )
-                last_alert = now
-        elif healthy:
-            fails, backoff = 0, 1.0
-            log_event("listen_exit", {"code": code, "ran_s": round(ran, 1), "stderr": why})
-        else:
-            fails += 1
-            log_event(
-                "listen_exit",
-                {"code": code, "consecutive": fails, "ran_s": round(ran, 1), "stderr": why},
-            )
-            sys.stderr.write(
-                f"clidecar gateway: listener exited ({code}) after {ran:.0f}s; restart {fails}\n"
-            )
-            if fails >= LISTEN_MAX_RESTARTS and now - last_alert >= LISTEN_ALERT_COOLDOWN_S:
-                alert(
-                    f"⚠️ clidecar inbound (WS): listener crash-looping ({fails}x, last exit {code}: {why}). "
-                    "Retrying the WS."
-                )
-                last_alert = now
-        stop.wait(backoff)
-        backoff = min(backoff * 2, 30.0)
-
-
-def inbound_loop(stop: threading.Event, broker: ex.Broker) -> None:
-    """Stream inbound over the adapter's `listen` (WS push) — the sole inbound path. `listen` is a
-    hard precondition: an adapter that doesn't declare it has no way in. Fail LOUD at boot (alert +
-    hold) rather than enter listen_loop, where a `listen` verb that blocks without output would hang
-    as a green-pid-but-silently-dead daemon. Retrying can't help — a capability only changes with a
-    redeploy + restart — so we alert once and hold instead of churning the supervisor."""
-    if not bool(channel.capabilities().get("listen")):
-        reason = "active channel adapter declares no `listen` capability — inbound is dead"
-        log_event("inbound_no_listen", {"reason": reason})
-        sys.stderr.write(f"clidecar gateway: {reason}\n")
-        alert(
-            f"⚠️ clidecar inbound DOWN at boot: {reason}. Fix the adapter and restart the gateway."
-        )
-        stop.wait()
+        outcome = broker.route_inbound(inb)
+    except Exception as e:  # one bad delivery must not fell inbound
+        log_event("route_error", {"message_id": mid, "via": "client", "error": repr(e)})
         return
-    listen_loop(stop, broker)
+    log_event("delivered", {"message_id": mid, "via": "client", "to": outcome})
+
+
+def _log_inbound_crash(fut: "Future[None]") -> None:
+    """An exception escaping _route_line's own catch (e.g. from_obj) lands on a Future we don't await,
+    so it would vanish with the message. Surface it instead of dropping inbound silently."""
+    exc = fut.exception()
+    if exc is not None:
+        log_event("inbound_worker_error", {"error": repr(exc)})
+        sys.stderr.write(f"clidecar gateway: inbound worker crashed: {exc!r}\n")
+
+
+def _make_on_inbound(broker: ex.Broker) -> "Callable[[str], None]":
+    """The adapter client's inbound sink — non-blocking by contract. Submit to the worker pool and
+    return at once, so the client's event loop is never blocked (and the deadlock rule holds)."""
+
+    def on_inbound(line: str) -> None:
+        _INBOUND_POOL.submit(_route_line, line, broker).add_done_callback(_log_inbound_crash)
+
+    return on_inbound
 
 
 def handle_request(req: "dict[str, object]") -> "dict[str, object] | None":
@@ -434,45 +331,65 @@ def handle_request(req: "dict[str, object]") -> "dict[str, object] | None":
     return _error(req_id, -32601, f"method not found: {method}")
 
 
-def _run_inbound(stop: threading.Event, broker: ex.Broker) -> None:
-    """Bring the whole daemon down loudly if the inbound loop dies unexpectedly (raises, or returns
-    while not stopping) — the supervisor then relaunches it — instead of a green pid with silently
-    dead inbound."""
-    try:
-        inbound_loop(stop, broker)
-        if stop.is_set():
-            return  # normal shutdown
-        reason = "inbound loop returned unexpectedly"
-    except Exception as e:
-        reason = f"inbound loop crashed: {e!r}"
-    log_event("inbound_dead", {"reason": reason})
-    alert(f"⚠️ clidecar {reason} — bringing the gateway down so the supervisor relaunches it.")
-    stop.set()
+def _hold(stop: threading.Event, reason: str) -> int:
+    """A boot precondition failed and retrying can't help (a capability/manifest only changes with a
+    redeploy + restart). Alert once and hold — don't churn the supervisor."""
+    log_event("inbound_down_at_boot", {"reason": reason})
+    sys.stderr.write(f"clidecar gateway: {reason}\n")
+    alert(f"⚠️ clidecar inbound DOWN at boot: {reason}. Fix the adapter and restart the gateway.")
+    stop.wait()
+    return 0
 
 
 def main() -> int:
-    """Run the persistent daemon: serve the broker socket and route inbound through it until SIGTERM.
-    Unlike the old stdio child, this process owns no MCP stream of its own — Claude attaches over the
-    socket via the shim, and the Broker drives handle_request/route_inbound."""
+    """This process owns no MCP stream of its own — Claude attaches over the socket via the shim, and
+    the Broker drives handle_request/route_inbound. Exits on SIGTERM or an unrecoverable client fatal
+    (→ the supervisor relaunches)."""
+    global _active_client
     stop = threading.Event()
-    broker = ex.Broker(transport=_transport, on_request=handle_request, notify=_channel_frame)
+    broker = ex.Broker(transport=_outbound, on_request=handle_request, notify=_channel_frame)
     broker.serve(ex.SOCK_PATH)
+
+    # `listen` (inbound) is a hard precondition: an adapter that can't receive has no way in. Fail
+    # LOUD at boot rather than come up green-pid-but-silently-deaf.
+    if not bool(channel.capabilities().get("listen")):
+        return _hold(
+            stop, "active channel adapter declares no `listen` capability — inbound is dead"
+        )
+    plugin_dir, ep, reason = channel.client_entrypoint()
+    if not plugin_dir or not ep:
+        return _hold(stop, reason or "no channel client entrypoint")
+
+    mod_name, cls_name = ep.split(":", 1)
+    sys.path.insert(0, plugin_dir)
+    client = cast(
+        "ChannelClient",
+        getattr(importlib.import_module(mod_name), cls_name)(_make_on_inbound(broker)),
+    )
+    _active_client = client
 
     def on_signal(_signum: int, _frame: object) -> None:
         stop.set()
-        _terminate_child()
+        client.shutdown()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
-    threading.Thread(target=_run_inbound, args=(stop, broker), daemon=True).start()
+    client.start()
     sys.stderr.write(
         f"clidecar gateway daemon: up — broker @ {ex.SOCK_PATH}, channel {SERVER_NAME!r}\n"
     )
 
-    stop.wait()  # keep alive; SIGTERM/SIGINT sets stop (and reaps the listener) then exits
-    _terminate_child()
+    # Block until SIGTERM (on_signal exits) or the client reports an unrecoverable connection.
+    fatal = cast("threading.Event", client.fatal)
+    while not stop.is_set():
+        if fatal.wait(timeout=1.0):
+            log_event("client_fatal", {"reason": client.fatal_reason})
+            alert(f"⚠️ clidecar inbound impaired — {client.fatal_reason}. Relaunching the gateway.")
+            client.shutdown()
+            return CLIENT_FATAL_EXIT
+    client.shutdown()
     return 0
 
 

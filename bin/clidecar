@@ -40,7 +40,7 @@ case "$cmd" in
     # Escape for a double-quoted shell value: backslash, double-quote, and BACKTICK,
     # so the value round-trips literally while $HOME-style expansion still works
     # (config.env's contract — see config.env.example). Backticks are load-bearing:
-    # config.env is sourced (sidecar.sh AND plugins/discord/msg.sh), so an unescaped
+    # config.env is sourced by sidecar.sh on every launch, so an unescaped
     # backtick command-substitutes on every source — a STARTUP_PROMPT containing
     # `clidecar gateway reload` once ran it in a loop and crash-bombed the supervisor.
     # $(...) still substitutes via the intentionally-live $; reject it below.
@@ -105,12 +105,15 @@ case "$cmd" in
     ;;
   gateway)
     # Manage the persistent gateway daemon. `reload` restarts the daemon (re-reads bridge/gateway.py
-    # core) WITHOUT touching Claude's context — the supervisor catches the flag on its next loop.
+    # core), then recycles Claude so its MCP shim reattaches to the new broker socket — a bare daemon
+    # restart strands inbound (the live shim can't reconnect a stdio server). The supervisor catches
+    # the flag on its next loop. Costs a context reset: checkpoint first, same as `recycle`.
     sub="${1:-status}"; shift || true
     case "$sub" in
       reload)
         touch "$CONTROL/GATEWAY_RELOAD"
-        echo "GATEWAY_RELOAD dropped — supervisor will restart the daemon (Claude untouched)."
+        echo "GATEWAY_RELOAD dropped — supervisor will restart the daemon AND recycle Claude so its"
+        echo "shim reattaches to the new socket. Checkpoint to state.md + memory FIRST (context resets)."
         ;;
       status)
         p="$(cat "$CONTROL/gateway.pid" 2>/dev/null || true)"

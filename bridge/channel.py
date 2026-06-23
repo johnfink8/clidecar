@@ -82,7 +82,13 @@ def _messaging_plugins() -> list[str]:
         names = sorted(os.listdir(_plugins_dir()))
     except OSError:
         return []
-    return [n for n in names if _manifest(n).kind == "messaging"]
+    # Only directories are plugin candidates — a sibling file (README.md) is not a
+    # broken plugin, so don't route it through _manifest's loud-error branch.
+    return [
+        n
+        for n in names
+        if os.path.isdir(os.path.join(_plugins_dir(), n)) and _manifest(n).kind == "messaging"
+    ]
 
 
 def active() -> tuple[str | None, str | None]:

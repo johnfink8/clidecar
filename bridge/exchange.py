@@ -312,6 +312,16 @@ class Broker:
         elif op == "latest":
             _send_line(conn, {"id": self.latest()})
             conn.close()
+        elif op == "buttons":
+            code, _ = self._op(
+                "buttons", str(req.get("message_id", "")), str(_num(req, "timeout", 570))
+            )
+            _send_line(conn, {"ok": code == 0})
+            conn.close()
+        elif op == "home":
+            code, out = self._op("home")
+            _send_line(conn, {"id": (out.strip() or None) if code == 0 else None})
+            conn.close()
         else:
             conn.close()
 
@@ -444,6 +454,24 @@ def react(message_id: str, emoji: str, add: bool = True, *, sock_path: str = SOC
 
 def latest(*, sock_path: str = SOCK_PATH) -> str | None:
     resp = _request({"op": "latest"}, sock_path)
+    v = resp.get("id") if resp is not None else None
+    return v if isinstance(v, str) else None
+
+
+def buttons(message_id: str, timeout: float, *, sock_path: str = SOCK_PATH) -> bool:
+    """Ask the gateway to attach approval buttons to an already-sent message, live for `timeout`
+    seconds (the caller's reply wait — the single source for the button lifetime). False if the
+    gateway is unreachable or the channel can't render them. Additive — the typed-reply path still
+    claims a reply if buttons fail, so a False degrades gracefully rather than blocking approval."""
+    resp = _request({"op": "buttons", "message_id": message_id, "timeout": timeout}, sock_path)
+    return bool(resp is not None and resp.get("ok"))
+
+
+def home(*, sock_path: str = SOCK_PATH) -> str | None:
+    """The active channel's home chat id (resolved adapter-side from its config), or None if the
+    gateway is unreachable / no home is configured. Lets a hook reach the user on a turn that carries
+    no inbound chat_id (plan mode entered autonomously)."""
+    resp = _request({"op": "home"}, sock_path)
     v = resp.get("id") if resp is not None else None
     return v if isinstance(v, str) else None
 

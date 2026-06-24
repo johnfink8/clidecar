@@ -562,6 +562,21 @@ def channel_latest() -> str | None:
     return ex.latest()
 
 
+def channel_home() -> str | None:
+    """The home chat id for a turn carrying no inbound chat_id — plan mode entered autonomously; see
+    exchange.home for how it's resolved. None if unresolved."""
+    return ex.home()
+
+
+def channel_buttons(message_id: str, timeout: float) -> bool:
+    """Attach approval buttons (live for `timeout`s) to an already-sent message. Additive: a False
+    (gateway down or channel without the capability) degrades to the typed-reply path, never blocks."""
+    ok = ex.buttons(message_id, timeout)
+    if not ok:
+        log_event("gateway_buttons_failed", {"message_id": message_id})
+    return ok
+
+
 def can(capability: str) -> bool:
     """Whether the active channel declares a capability (edit/react/latest), so the core
     can degrade — e.g. skip the 👀 react or the re-home check on a channel that lacks them."""

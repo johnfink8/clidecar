@@ -74,13 +74,17 @@ def is_approval(reply: str) -> bool:
     return reply.strip().strip(".!").casefold() in AFFIRMATIVES
 
 
-def render_plan(plan: str) -> str:
+def render_plan(plan: str, buttons: bool) -> str:
     body = plan.strip() or "_(empty plan)_"
-    return (
-        "📋 **Plan ready for approval**\n\n"
-        f"{body}\n\n"
-        "_Reply **yes / go / lgtm** to approve and start, or describe changes to keep planning._"
+    # The typed-reply path is named in BOTH footers: buttons are additive and may fail to attach, so
+    # the user must never be told only to "click" a button that might not be there.
+    footer = (
+        "_**Approve** below — or reply **yes / go / lgtm** — to start; **Request changes**, or just "
+        "reply with what to change, to keep planning._"
+        if buttons
+        else "_Reply **yes / go / lgtm** to approve and start, or describe changes to keep planning._"
     )
+    return f"📋 **Plan ready for approval**\n\n{body}\n\n{footer}"
 
 
 def decision(behavior: str, message: str, tool_input: dict[str, object]) -> str:
@@ -109,14 +113,21 @@ def main() -> None:
     plan = plan if isinstance(plan, str) else ""
 
     turn = h.load_turn(sid)
-    chat_id = turn.chat_id if turn else None
+    # An autonomously-entered plan-mode turn carries no inbound chat_id; fall back to the channel's
+    # home chat so the gate can still reach the user (and isn't trapped in plan mode).
+    chat_id = (turn.chat_id if turn else None) or h.channel_home()
+    use_buttons = h.can("buttons")
     # Newest message id BEFORE posting, so the Exchange only claims a genuinely new reply.
-    since_id = h.channel_latest() if chat_id else None
+    since_id = h.channel_latest()
 
-    posted = bool(chat_id) and h.channel_send(render_plan(plan))
+    # Posting needs no chat_id (channel_send targets the active channel); only awaiting a reply does.
+    mid = h.channel_send(render_plan(plan, use_buttons))
 
     reply = None
-    if posted and chat_id and since_id is not None:
+    awaited = mid is not None and bool(chat_id) and since_id is not None
+    if awaited and chat_id and since_id is not None:
+        if use_buttons and mid is not None:
+            h.channel_buttons(mid, ANSWER_TIMEOUT)
         ans = ex.ask(chat_id, None, since_id=since_id, timeout=ANSWER_TIMEOUT, label="plan")
         reply = ans.content if ans else None
 
@@ -128,7 +139,7 @@ def main() -> None:
             f"The user reviewed the plan on their channel and asked for changes: {reply}\n"
             "Stay in plan mode, revise the plan accordingly, then call ExitPlanMode again."
         )
-    elif posted:
+    elif awaited:
         behavior, message, outcome = "deny", DENY_NO_REPLY, "no_reply"
     else:
         behavior, message, outcome = "deny", DENY_UNREACHABLE, "unreachable"

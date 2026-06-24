@@ -35,6 +35,14 @@ CREDS_FILE = os.path.expanduser("~/.claude/channels/discord/.env")
 DOWN_GRACE = 180.0
 WATCHDOG_TICK = 15.0
 READY_WAIT_S = 20.0  # bound an outbound's wait for the connection (the daemon caps the whole call)
+APPROVAL_TIMEOUT = 600.0  # fallback View/Modal lifetime when the buttons call carries no deadline
+VIEW_GRACE_S = (
+    15.0  # the View outlives the hook's reply wait by this, so no claim-open-but-View-shut gap
+)
+
+# A bound (interaction, content) -> bool: synthesize an inbound from the interaction and deliver it,
+# returning True only if it passed the allowlist gate (False = a non-allowlisted click, dropped).
+Deliver = Callable[[discord.Interaction, str], bool]
 
 
 def _read_creds() -> "tuple[str, str]":
@@ -142,6 +150,99 @@ class _Listener(discord.Client):
             self._on_inbound(line)  # non-blocking by contract — must not block the event loop
 
 
+def _deliver_interaction(
+    on_inbound: "Callable[[str], None]",
+    allow: "set[str]",
+    channel_id: str,
+    interaction: discord.Interaction,
+    content: str,
+) -> bool:
+    """Turn a button/modal interaction into a gate-shaped inbound line and hand it to the daemon's
+    sink, exactly as on_message does. The interaction's snowflake id is newer than the plan message,
+    so a waiting ex.ask claim matches it. Returns True only if gate.shape passed the allowlist — a
+    non-allowlisted click is dropped (fail-closed) and returns False so the caller doesn't stamp a
+    success it didn't cause."""
+    user = interaction.user
+    raw: dict[str, object] = {
+        "id": str(interaction.id),
+        "channel_id": str(channel_id),
+        "content": content,
+        "timestamp": interaction.created_at.isoformat(),
+        "author": {"id": str(user.id), "username": user.name, "bot": user.bot},
+        "attachments": [],
+    }
+    line = gate.shape(raw, allow)
+    if line is None:
+        return False
+    on_inbound(line)
+    return True
+
+
+async def _deny_click(interaction: discord.Interaction) -> None:
+    """Acknowledge a non-allowlisted click without touching the plan message — Discord requires a
+    response within 3s, and leaving the buttons in place keeps the gate honest (no false stamp)."""
+    await interaction.response.send_message(
+        "You're not on this channel's allowlist, so this isn't yours to decide.", ephemeral=True
+    )
+
+
+class _ReviseModal(discord.ui.Modal):
+    """The Request-changes popup: John's typed feedback becomes the revise-context — a non-affirmative
+    reply, so the plan hook DENIES and stays in plan mode."""
+
+    def __init__(
+        self, deliver: "Deliver", plan_message: "discord.Message | None", timeout: float
+    ) -> None:
+        super().__init__(title="Request changes", timeout=timeout)
+        self._deliver = deliver
+        self._plan_message = plan_message
+        self._feedback: discord.ui.TextInput[discord.ui.View] = discord.ui.TextInput(
+            label="What should change?", style=discord.TextStyle.paragraph, max_length=1500
+        )
+        self.add_item(self._feedback)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        delivered = self._deliver(
+            interaction, str(self._feedback.value).strip() or "(no feedback given)"
+        )
+        if not delivered:
+            await _deny_click(interaction)
+            return
+        body = self._plan_message.content if self._plan_message else ""
+        await interaction.response.edit_message(
+            content=f"{body}\n\n📝 Changes requested.", view=None
+        )
+
+
+class _ApprovalView(discord.ui.View):
+    """Approve / Request-changes buttons on a plan message. Approve delivers a bare affirmative so the
+    plan hook's is_approval matches and plan mode exits; Request-changes opens a modal whose text is
+    the revise-context. The timeout outlives the hook's wait so a click always lands while the claim
+    is open."""
+
+    def __init__(self, deliver: "Deliver", timeout: float) -> None:
+        super().__init__(timeout=timeout)
+        self._deliver = deliver
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
+    async def approve(
+        self, interaction: discord.Interaction, _button: "discord.ui.Button[discord.ui.View]"
+    ) -> None:
+        if not self._deliver(interaction, "approve"):
+            await _deny_click(interaction)
+            return
+        body = interaction.message.content if interaction.message else ""
+        await interaction.response.edit_message(content=f"{body}\n\n✅ Approved.", view=None)
+
+    @discord.ui.button(label="Request changes", style=discord.ButtonStyle.secondary)
+    async def revise(
+        self, interaction: discord.Interaction, _button: "discord.ui.Button[discord.ui.View]"
+    ) -> None:
+        await interaction.response.send_modal(
+            _ReviseModal(self._deliver, interaction.message, self.timeout or APPROVAL_TIMEOUT)
+        )
+
+
 class DiscordClient:
     """The adapter the daemon loads. Satisfies bridge/channel.ChannelClient structurally:
     `loop`, `fatal`/`fatal_reason`, `start()`, `shutdown()`, `dispatch(verb, *args) -> (code, str)`.
@@ -149,6 +250,8 @@ class DiscordClient:
 
     def __init__(self, on_inbound: "Callable[[str], None]") -> None:
         self._token, self._channel_id = _read_creds()
+        self._on_inbound = on_inbound
+        self._allow = gate.allowed_senders()
         self._ready = threading.Event()
         self.fatal = threading.Event()
         self.fatal_reason = ""
@@ -156,10 +259,13 @@ class DiscordClient:
         self._link = _Link()
         self._ch: discord.abc.Messageable | None = None
         self.loop = asyncio.new_event_loop()
-        self._client = _Listener(
-            self._channel_id, gate.allowed_senders(), on_inbound, self._ready, self._link
-        )
+        self._client = _Listener(self._channel_id, self._allow, on_inbound, self._ready, self._link)
         self._thread = threading.Thread(target=self._loop_main, name="discord-loop", daemon=True)
+
+    def _deliver(self, interaction: discord.Interaction, content: str) -> bool:
+        return _deliver_interaction(
+            self._on_inbound, self._allow, self._channel_id, interaction, content
+        )
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -244,6 +350,8 @@ class DiscordClient:
     async def _dispatch(self, verb: str, *args: str) -> "tuple[int, str]":
         """Map an adapter verb to discord.py. Returns (0, stdout) on success — stdout carries the
         new message id for `send`/`latest` and the rendered lines for `fetch` — else (1, "")."""
+        if verb == "home":
+            return 0, self._channel_id  # pure config — answerable even while the link is down
         try:
             await asyncio.wait_for(self._client.wait_until_ready(), timeout=READY_WAIT_S)
             ch = await self._channel()
@@ -281,6 +389,14 @@ class DiscordClient:
                 rendered = [history.render(_raw(m)) async for m in ch.history(limit=n)]
                 lines = [ln for ln in reversed(rendered) if ln]  # history() is newest-first
                 return 0, ("\n".join(lines) + "\n" if lines else "")
+            if verb == "buttons":
+                # The View lifetime derives from the hook's reply wait (args[1]) plus a grace, so
+                # there's one source of truth for it — not a magic constant re-declared here.
+                mid = args[0] if args else ""
+                view_timeout = float(args[1]) + VIEW_GRACE_S if len(args) > 1 else APPROVAL_TIMEOUT
+                msg = await ch.fetch_message(int(mid))
+                await msg.edit(view=_ApprovalView(self._deliver, view_timeout))
+                return 0, ""
             return 1, ""
         except (discord.HTTPException, discord.NotFound, ValueError, RuntimeError, OSError) as e:
             sys.stderr.write(f"discord dispatch {verb!r} failed: {e!r}\n")

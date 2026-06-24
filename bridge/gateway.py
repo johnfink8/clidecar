@@ -110,7 +110,14 @@ def _outbound(*args: str) -> "tuple[int, str]":
         sys.stderr.write("clidecar gateway: no adapter client / empty call\n")
         return 1, ""
     loop = cast("asyncio.AbstractEventLoop", client.loop)
-    fut = asyncio.run_coroutine_threadsafe(client.dispatch(args[0], *args[1:]), loop)
+    try:
+        # Scheduling itself raises (not just fut.result) if the loop is closing/closed under us — a
+        # shutdown race. Catch it here so it can't throw uncaught and fell the broker handler thread,
+        # silently dropping the dispatch.
+        fut = asyncio.run_coroutine_threadsafe(client.dispatch(args[0], *args[1:]), loop)
+    except Exception as e:
+        sys.stderr.write(f"clidecar gateway: outbound {args[0]!r} could not schedule: {e!r}\n")
+        return 1, ""
     try:
         return fut.result(timeout=TRANSPORT_TIMEOUT_S)
     except FutureTimeout:

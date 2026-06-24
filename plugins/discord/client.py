@@ -124,6 +124,13 @@ class _Listener(discord.Client):
             self._link.connected = False
             self._link.down_since = time.monotonic()
 
+    async def on_resumed(self) -> None:
+        # discord.py RESUMEs routinely drop the WS (on_disconnect) and resume it WITHOUT a fresh
+        # on_connect — so without this, down_since stays stuck from the disconnect and the watchdog
+        # falsely fatals a healthy link after DOWN_GRACE. Clear liveness exactly like on_connect.
+        self._link.connected = True
+        self._link.down_since = None
+
     async def on_ready(self) -> None:
         self._ready_evt.set()
 

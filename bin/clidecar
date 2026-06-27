@@ -6,8 +6,9 @@
 #   clidecar reload            # swap sidecar code without disturbing Claude
 #   clidecar status            # systemd status of the sidecar
 #   clidecar logs [N]          # last N journald lines (default 50)
-#   clidecar down              # stop sidecar AND kill the managed Claude
+#   clidecar down              # stop sidecar AND kill every managed agent
 #   clidecar up                # (re)start the sidecar service
+#   clidecar agent list|spawn|stop|start|remove|route|set|recycle [...]   # manage the fleet
 #   clidecar plugin list|enable|disable [name]   # manage hook plugins (recycle to apply)
 #   clidecar gateway reload|status|logs [N]      # manage the persistent gateway daemon
 set -uo pipefail
@@ -25,9 +26,34 @@ CONFIG_FILE="$CLIDECAR_DATA/config.env"
 cmd="${1:-help}"; shift || true
 case "$cmd" in
   recycle)
-    touch "$CONTROL/RECYCLE"
-    echo "RECYCLE dropped. Did you checkpoint to state.md + memory first? The"
-    echo "sidecar will SIGTERM this session and relaunch a fresh one."
+    # Agent-aware: from inside an agent's session CLIDECAR_AGENT_ID is set, so recycle just THAT
+    # agent; from the console (no env) drop the global flag = recycle every enabled agent.
+    if [ -n "${CLIDECAR_AGENT_ID:-}" ]; then
+      mkdir -p "$CONTROL/agents/$CLIDECAR_AGENT_ID"
+      touch "$CONTROL/agents/$CLIDECAR_AGENT_ID/RECYCLE"
+      echo "RECYCLE dropped for agent '$CLIDECAR_AGENT_ID'. Checkpoint to state.md + memory FIRST —"
+      echo "the sidecar will SIGTERM this session and relaunch it fresh."
+    else
+      touch "$CONTROL/RECYCLE"
+      echo "RECYCLE (all agents) dropped. Checkpoint FIRST — every enabled agent is relaunched fresh."
+    fi
+    ;;
+  agent)
+    sub="${1:-list}"; shift || true
+    FC="$CLIDECAR_HOME/bin/_fleetctl.py"
+    case "$sub" in
+      list|ls)  python3 "$FC" list ;;
+      recycle)
+        id="${1:?usage: clidecar agent recycle <id>}"
+        mkdir -p "$CONTROL/agents/$id"; touch "$CONTROL/agents/$id/RECYCLE"
+        echo "recycle flag dropped for agent '$id'." ;;
+      spawn|add) python3 "$FC" add "$@" && echo "added to fleet — supervisor will launch it." ;;
+      stop)      python3 "$FC" disable "$@" && echo "disabled — supervisor will stop it." ;;
+      start)     python3 "$FC" enable "$@" && echo "enabled — supervisor will launch it." ;;
+      remove)    python3 "$FC" remove "$@" && echo "removed from fleet." ;;
+      route|set) python3 "$FC" set "$@" && echo "updated (applies on next relaunch)." ;;
+      *) echo "usage: clidecar agent list|spawn|stop|start|remove|route|set|recycle [...]" >&2; exit 1 ;;
+    esac
     ;;
   set)
     key="${1:?usage: clidecar set KEY VALUE}"; val="${2:?usage: clidecar set KEY VALUE}"
@@ -86,17 +112,23 @@ case "$cmd" in
     else
       echo "warning: $CONFIG_FILE not found — using defaults for teardown." >&2
     fi
-    # kill the managed claude by PID first — quitting the screen alone can leave
-    # claude orphaned (it survives the SIGHUP), so signal it explicitly.
-    p="$(cat "$CONTROL/claude.pid" 2>/dev/null || true)"
-    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
-      kill -TERM "$p" 2>/dev/null || true
-      for _ in $(seq 1 "${GRACE_SECS:-10}"); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
-      kill -KILL "$p" 2>/dev/null || true
+    # Kill EVERY managed agent by PID — quitting a screen alone can leave claude orphaned (it
+    # survives the SIGHUP), so signal each explicitly, then quit its screen.
+    if [ -d "$CONTROL/agents" ]; then
+      for d in "$CONTROL/agents"/*/; do
+        [ -d "$d" ] || continue
+        id="$(basename "$d")"
+        p="$(cat "$d/claude.pid" 2>/dev/null || true)"
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+          kill -TERM "$p" 2>/dev/null || true
+          for _ in $(seq 1 "${GRACE_SECS:-10}"); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+          kill -KILL "$p" 2>/dev/null || true
+        fi
+        screen -S "${SCREEN_NAME:-clidecar}-$id" -X quit >/dev/null 2>&1 || true
+        rm -f "$d/claude.pid"
+      done
     fi
-    screen -S "${SCREEN_NAME:-clidecar}" -X quit >/dev/null 2>&1 || true
-    rm -f "$CONTROL/claude.pid"
-    echo "sidecar stopped and managed Claude killed."
+    echo "sidecar stopped and all managed agents killed."
     ;;
   up)     systemctl --user start clidecar && echo "sidecar started." ;;
   plugin)
@@ -112,8 +144,8 @@ case "$cmd" in
     case "$sub" in
       reload)
         touch "$CONTROL/GATEWAY_RELOAD"
-        echo "GATEWAY_RELOAD dropped — supervisor will restart the daemon AND recycle Claude so its"
-        echo "shim reattaches to the new socket. Checkpoint to state.md + memory FIRST (context resets)."
+        echo "GATEWAY_RELOAD dropped — supervisor will restart the daemon AND recycle ALL agents so"
+        echo "their shims reattach to the new socket. Checkpoint to state.md + memory FIRST (context resets)."
         ;;
       status)
         p="$(cat "$CONTROL/gateway.pid" 2>/dev/null || true)"

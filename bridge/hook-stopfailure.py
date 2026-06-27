@@ -105,6 +105,7 @@ def main() -> None:
 
     state = h.load_turn(sid)
     src = state.source_message_id if state else None
+    h.set_target((state.chat_id if state else None) or h.channel_home())
     msg = notice(kind, klass)
     if not h.channel_send(msg, reply_to=src):
         # Gateway unreachable AND (if path is None) the disk write also failed — the total-

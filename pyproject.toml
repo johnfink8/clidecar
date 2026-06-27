@@ -33,7 +33,9 @@ ignore = ["E501"]
 
 # Consolidated from the former pyrightconfig.json — single source of config.
 [tool.pyright]
-include = ["bridge", "plugins"]
+include = ["bridge", "plugins", "bin/_fleetctl.py"]
+# bin/_fleetctl.py adds bridge/ to sys.path at runtime to import fleet.py; mirror that for the checker.
+extraPaths = ["bridge"]
 typeCheckingMode = "strict"
 pythonVersion = "3.12"
 pythonPlatform = "Linux"

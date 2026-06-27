@@ -80,6 +80,7 @@ def main() -> None:
 
     turn = h.load_turn(sid)
     chat_id = turn.chat_id if turn else None
+    h.set_target(chat_id or h.channel_home())
     # The newest message id BEFORE posting, so the Exchange only claims a genuinely new reply.
     since_id = h.channel_latest() if chat_id else None
 

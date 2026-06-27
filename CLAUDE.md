@@ -1,11 +1,14 @@
 # clidecar — project guide
 
 Self-recycling Claude harness: a systemd --user service (`bin/sidecar.sh`)
-supervises two long-lived children — a `claude` session (in `screen`) and a
-persistent gateway daemon that owns the messaging-channel connection. The session
-can reset its own context, relaunch in a new workdir/params, and hot-swap its own
-supervisor; the daemon survives recycles so inbound isn't missed. User-facing
-overview + design in [README.md](README.md).
+supervises a FLEET of `claude` agent sessions (each in its own `screen`, bound to
+its own Discord channel) plus one persistent gateway daemon that owns the
+messaging-channel connection and routes channel→agent. Each session can reset its
+own context, relaunch in a new workdir/params, and hot-swap its own supervisor; the
+daemon survives recycles so inbound isn't missed. The fleet's desired state lives in
+the `~/.clidecar/fleet.db` SQLite store; a deterministic control channel manages it from Discord.
+Multi-agent design: [docs/multi-agent.md](docs/multi-agent.md). User-facing overview
++ design in [README.md](README.md).
 
 ## Working on this repo
 
@@ -23,9 +26,10 @@ overview + design in [README.md](README.md).
   hook files) needs a `clidecar recycle` to take effect. (Distinct from `bin/sidecar.sh`, which
   needs `clidecar reload`.) NOTE: the messaging ADAPTER is no longer live-on-save — it's now an
   in-process client imported INTO the daemon (next bullet), so adapter edits need a `gateway reload`.
-- **Gateway daemon CORE edits (`bridge/gateway.py`, `exchange.py`, `channel.py`, and the active
-  adapter client `plugins/<name>/client.py` + what it imports — `gate.py`/`history.py`/`_message.py`)
-  need `clidecar gateway reload`** — the running daemon imported them at start. The hook scripts that
+- **Gateway daemon CORE edits (`bridge/gateway.py`, `exchange.py`, `channel.py`, `control.py`,
+  `translate.py`, and the active adapter client `plugins/<name>/client.py` + what it imports —
+  `gate.py`/`history.py`/`_message.py`) need `clidecar gateway reload`** — the running daemon
+  imported them at start. The hook scripts that
   talk to it are still live-on-save (above); only the daemon process itself must be restarted. The new daemon serves a fresh broker socket and the live
   session's shim can't reconnect a stdio server mid-session, so `gateway reload` now
   ALSO recycles Claude (supervisor-side) so a fresh shim attaches to the new socket —
@@ -54,14 +58,21 @@ overview + design in [README.md](README.md).
 
 ## Architecture map
 
-- `bin/sidecar.sh` — supervisor loop: keeps TWO children alive (the managed `claude`
-  in screen + the gateway daemon) → wait-for-event → recycle/relaunch; relaunches the
-  daemon if it dies, without recycling Claude.
+- `bin/sidecar.sh` — supervisor loop: keeps the gateway daemon + the FLEET of agents
+  alive (`reconcile_agents` launches enabled-but-dead, stops removed; per-agent screen
+  `clidecar-<id>` + pidfile `agents/<id>/claude.pid` + `agents/<id>/RECYCLE`) →
+  wait-for-event → recycle/relaunch. Reconciles to the `fleet.db` store; FAILS CLOSED on an
+  unreadable store (keeps the live fleet, never reconciles to empty).
 - `bin/clidecar` — control CLI (recycle / set / reload / status / logs / down / up /
-  plugin / gateway). Symlinked onto PATH; resolves its own symlink to find the repo root.
+  agent / plugin / gateway). `recycle` is agent-aware (CLIDECAR_AGENT_ID → that agent,
+  else all); `agent list|spawn|stop|start|remove|route|set|recycle` drives the fleet.
+  Symlinked onto PATH; resolves its own symlink to find the repo root.
 - `bin/notify-discord.sh` — bot-API ping for code paths that can't reach the gateway.
 - `bin/fallback.sh` — OnFailure one-shot: restore known-good sidecar, notify.
 - `bin/_pluginctl.py` — enable/disable/list hook plugins by editing `.claude/settings.json`.
+- `bin/_fleetctl.py` — CLI over `bridge/fleet.py` (list/get/routes/seed/add/set/remove/
+  enable/disable/validate) so the bash supervisor reads + mutates the `fleet.db` store.
+  Stdlib-only — `sqlite3` (runs under system python3, not the venv).
 - `bridge/` — the channel-agnostic, Claude-aware bridge core. Typed under **pyright
   strict** (config in `pyproject.toml`); every JSON boundary validated via each
   dataclass's `from_obj` builder. Two halves:
@@ -72,10 +83,21 @@ overview + design in [README.md](README.md).
     `on_inbound` that hands each line to a worker pool. **No-deadlock rule: `route_inbound` must
     never run on the client's loop thread** (it re-enters outbound for the ❌ no-Claude react).
     `exchange.py` = the unix-socket Broker (routes each inbound to EXACTLY ONE sink — open claim →
-    attached Claude → else ❌; emit/edit/react/latest with retries + dedup; `emit` returns the msg
-    id) plus its client helpers + `ask()` (cross-process request→reply) — transport-agnostic, takes
-    `_transport` by injection, unchanged by the client swap. `gateway-shim.py` = the disposable
-    per-launch MCP-stdio shim Claude Code spawns to attach to the daemon socket.
+    the CONTROL channel (`on_control`) → the agent bound to its chat_id via `set_routes` → else ❌;
+    `_channels` is an `agent_id → socket` registry, newest-attach-wins per agent; emit/edit/react/
+    latest all take a chat_id and dedup per-channel; `emit` returns the msg id) plus its client
+    helpers + `ask()` (cross-process request→reply) — transport-agnostic, takes `_transport` by
+    injection. `fleet.py` = the `fleet.db` SQLite store + fleet model (load/save/validate, routes + listen-set);
+    `control.py` = the owner-gated control-channel handler: hands the message to `translate.py`,
+    then runs the proposed command through its deterministic dispatch table (`_HANDLERS`, the
+    vocabulary's source of truth; the `GRAMMAR` shown to the translator and the `HELP` shown to humans
+    are checked against it at import by `_check_vocab_lockstep`, so the three can't silently drift) —
+    the sole executor + ground-truth responder.
+    `translate.py` = isolated `claude -p` (Haiku) front-end that turns NL into `{command, reply}`;
+    it only PROPOSES (deterministic gate still decides), and on failure `control` falls back to a
+    literal parse so exact commands never depend on Haiku.
+    `gateway-shim.py` = the disposable per-launch MCP-stdio shim, now announcing
+    `{"role":"channel","agent":<CLIDECAR_AGENT_ID>}` so the daemon keys the right agent.
   - **Output + question hooks** — `hook-{ack,progress,final}.py` = UserPromptSubmit /
     PostToolUse+MessageDisplay / Stop (👀 ack, live status mirror, deterministic Stop-hook
     final answer); `hook-question.py` = the AskUserQuestion PreToolUse hook (renders options
@@ -101,8 +123,8 @@ overview + design in [README.md](README.md).
 - `pyproject.toml` — uv project: runtime deps (croniter, holidays) + dev tooling (ruff,
   pyright) + their config. `uv sync` builds `.venv`; the daemon runs under it via `PYTHON_BIN`.
 - `docs/` — design specs (e.g. `scheduler.md`, the heartbeat scheduler).
-- `~/.clidecar/control/` — runtime flags (`RECYCLE`) + `claude.pid` + `gateway.pid` + the
-  gateway broker socket.
+- `~/.clidecar/control/` — runtime flags (global `RECYCLE` + per-agent
+  `agents/<id>/{claude.pid,RECYCLE}`) + `gateway.pid` + the gateway broker socket.
 - `~/.clidecar/state/` — live `state.md` (the "now") + `queue.md` (backlog) + gateway logs/events.
   The repo ships `state/*.md.example` templates only.
 

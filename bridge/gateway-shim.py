@@ -13,6 +13,8 @@ Claude, but races happen) the shim retries briefly, then exits — CC sees the c
 rather than the shim hanging.
 """
 
+import json
+import os
 import socket
 import sys
 import threading
@@ -41,9 +43,16 @@ def main() -> int:
     if conn is None:
         sys.stderr.write(f"clidecar gateway-shim: daemon socket {SOCK_PATH} unreachable\n")
         return 1
-    conn.sendall(
-        b'{"role":"channel"}\n'
-    )  # role handshake: this is the MCP channel, not a broker client
+    # Role handshake: this is the MCP channel (not a broker client), and WHICH agent it is. The
+    # supervisor exports CLIDECAR_AGENT_ID when it launches each agent's Claude. Fail LOUD if it's
+    # unset rather than attach anonymously: the daemon keys its registry (newest-wins) on this id, so
+    # a wrong/empty id would silently EVICT a real agent's socket and hijack its channel routing.
+    agent = os.environ.get("CLIDECAR_AGENT_ID", "").strip()
+    if not agent:
+        sys.stderr.write("clidecar gateway-shim: CLIDECAR_AGENT_ID unset — refusing to attach\n")
+        conn.close()
+        return 1
+    conn.sendall((json.dumps({"role": "channel", "agent": agent}) + "\n").encode())
 
     def daemon_to_cc() -> None:
         with conn.makefile("r", encoding="utf-8") as fh:

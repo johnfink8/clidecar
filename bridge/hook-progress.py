@@ -6,7 +6,7 @@ tool calls; MessageDisplay catches narration as it's displayed, so a narration s
 immediately instead of only when the next tool runs. Opened lazily by the first real
 content (narration or a non-Discord tool), so an empty turn posts nothing — the 👀
 reaction is the only acknowledgement. Re-homes (freezes the current message and starts a
-fresh one) when a newer message has landed below it — John writing mid-turn — carrying
+fresh one) when a newer message has landed below it — the owner writing mid-turn — carrying
 only the lines since the freeze so the new message never duplicates the old one.
 
 Everything is rendered at line granularity (split_units) and SPILLS append-only: when the
@@ -35,6 +35,7 @@ def main() -> None:
     # status message; the second to enter sees the message_id and edits instead.
     with h.turn_lock(sid):
         state = h.load_turn(sid) or h.TurnState()
+        h.set_target(state.chat_id or h.channel_home())
         if tid is not None and state.done == tid:
             return  # THIS turn already finalized by the Stop hook — don't resurrect it
 

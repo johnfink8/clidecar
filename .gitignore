@@ -14,3 +14,6 @@ __pycache__/
 
 # uv-managed virtualenv (recreated from pyproject.toml + uv.lock via `uv sync`).
 .venv/
+
+# Throwaway working dir for ephemeral tests/scratch — never committed.
+scratchpad/

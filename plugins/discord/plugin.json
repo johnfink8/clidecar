@@ -3,5 +3,5 @@
   "kind": "messaging",
   "description": "Discord messaging adapter: an in-process discord.py client owning inbound (Gateway WS) + outbound (send/edit/react/latest/fetch). Knows nothing about Claude — the clidecar bridge core drives it.",
   "client": "client:DiscordClient",
-  "capabilities": { "edit": true, "react": true, "latest": true, "listen": true, "fetch": true, "buttons": true }
+  "capabilities": { "edit": true, "react": true, "latest": true, "listen": true, "fetch": true, "buttons": true, "create": true }
 }

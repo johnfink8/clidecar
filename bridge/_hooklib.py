@@ -528,11 +528,36 @@ def turn_lock(session_id: str | None) -> Generator[None, None, None]:
             fh.close()
 
 
+# The target channel for this hook process's outbound. A hook runs as a fresh, single-turn,
+# single-agent process, so one module global is correct + race-free: each hook sets it once (from the
+# turn's chat_id, else its own agent's channel) before any channel_* call. Multi-agent: this is what
+# makes a hook's output land in ITS agent's channel and not another's.
+_target: str | None = None
+
+
+def set_target(chat_id: str | None) -> None:
+    global _target
+    _target = chat_id
+
+
+def _require_target() -> str | None:
+    if not _target:
+        log_event("no_channel_target", {})
+        sys.stderr.write("clidecar bridge: no channel target set for outbound (fail-loud)\n")
+        return None
+    return _target
+
+
 def channel_send(text: str, reply_to: str | None = None) -> str | None:
     """Send one message through the gateway broker and return its new id. STRICT LANES: the hook
     never touches the adapter — if the gateway is unreachable, fail LOUD (log + stderr) and return
     None so the caller persists/pings, NEVER a reach-around to the transport."""
-    mid = ex.emit(ex.Outbound(text=text, kind="message", source="claude", reply_to=reply_to))
+    target = _require_target()
+    if target is None:
+        return None
+    mid = ex.emit(
+        ex.Outbound(text=text, kind="message", source="claude", chat_id=target, reply_to=reply_to)
+    )
     if mid is None:
         log_event("gateway_send_failed", {"chars": len(text)})
         sys.stderr.write(
@@ -542,14 +567,20 @@ def channel_send(text: str, reply_to: str | None = None) -> str | None:
 
 
 def channel_edit(message_id: str, text: str) -> bool:
-    ok = ex.edit(message_id, text)
+    target = _require_target()
+    if target is None:
+        return False
+    ok = ex.edit(target, message_id, text)
     if not ok:
         log_event("gateway_edit_failed", {"message_id": message_id})
     return ok
 
 
 def channel_react(message_id: str, emoji: str, add: bool = True) -> bool:
-    ok = ex.react(message_id, emoji, add)
+    target = _require_target()
+    if target is None:
+        return False
+    ok = ex.react(target, message_id, emoji, add)
     if not ok:
         log_event("gateway_react_failed", {"message_id": message_id, "emoji": emoji})
     return ok
@@ -557,21 +588,30 @@ def channel_react(message_id: str, emoji: str, add: bool = True) -> bool:
 
 def channel_latest() -> str | None:
     """The channel's most recent message id, or None. Lets the progress hook tell when a new
-    message (John's) has landed below its status message so it can re-home a fresh one rather than
+    message (the owner's) has landed below its status message so it can re-home a fresh one rather than
     keep editing a message that has scrolled out of view."""
-    return ex.latest()
+    target = _require_target()
+    if target is None:
+        return None
+    return ex.latest(target)
 
 
 def channel_home() -> str | None:
-    """The home chat id for a turn carrying no inbound chat_id — plan mode entered autonomously; see
-    exchange.home for how it's resolved. None if unresolved."""
-    return ex.home()
+    """The home chat id for a turn carrying no inbound chat_id (plan mode entered autonomously). In
+    multi-agent, that's THIS agent's own channel — set by the supervisor as CLIDECAR_AGENT_CHANNEL —
+    so a hook reaches its own channel without guessing. Falls back to the adapter's legacy home for a
+    single-agent setup. None if neither resolves."""
+    env_channel = os.environ.get("CLIDECAR_AGENT_CHANNEL", "").strip()
+    return env_channel or ex.home()
 
 
 def channel_buttons(message_id: str, timeout: float) -> bool:
     """Attach approval buttons (live for `timeout`s) to an already-sent message. Additive: a False
     (gateway down or channel without the capability) degrades to the typed-reply path, never blocks."""
-    ok = ex.buttons(message_id, timeout)
+    target = _require_target()
+    if target is None:
+        return False
+    ok = ex.buttons(target, message_id, timeout)
     if not ok:
         log_event("gateway_buttons_failed", {"message_id": message_id})
     return ok

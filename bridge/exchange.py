@@ -52,6 +52,9 @@ Transport = Callable[
 ]  # the adapter shell-out: (verb, *args) -> (returncode, stdout)
 OnRequest = Callable[["dict[str, object]"], "dict[str, object] | None"]
 Notify = Callable[["Inbound"], "dict[str, object]"]
+OnControl = Callable[
+    ["Inbound"], None
+]  # handle a message on the control channel (parse + act + reply)
 
 
 @dataclass(frozen=True)
@@ -77,13 +80,16 @@ class Inbound:
 
 @dataclass(frozen=True)
 class Outbound:
-    """A message to the user. `kind`+`dedup_key` is the idempotency token: the same logical message
-    emitted twice (Claude's closing hook vs. a gateway echo of it) is sent once. dedup_key=None opts
-    out — for genuinely distinct messages like the streamed status frames."""
+    """A message to the user. `chat_id` is the target Discord channel (multi-agent: each agent owns
+    one channel, so every outbound names where it lands). `kind`+`dedup_key` is the idempotency token,
+    scoped per chat_id: the same logical message emitted twice is sent once, but two agents' identical
+    text never cross-dedup. dedup_key=None opts out — for genuinely distinct messages like the
+    streamed status frames."""
 
     text: str
     kind: Kind
     source: str  # "claude" | "gateway" | "tool"
+    chat_id: str
     dedup_key: str | None = None
     reply_to: str | None = None
 
@@ -130,32 +136,49 @@ def _recv_line(conn: socket.socket) -> dict[str, object] | None:
 
 class Broker:
     """The gateway's transport mediator: a Unix-socket server + an in-memory claim registry + the
-    attach point for Claude. The gateway constructs ONE Broker with its `transport`, its
-    `on_request` (answer one MCP request) and `notify` (build an inbound's channel frame), calls
-    serve() once (spawns the accept + reap threads), and calls route_inbound() for every message it
-    receives from the transport.
+    attach point for the AGENT FLEET. The gateway constructs ONE Broker with its `transport`, its
+    `on_request` (answer one MCP request) and `notify` (build an inbound's channel frame), optionally
+    an `on_control` (handle a control-channel command), calls serve() once (spawns the accept + reap
+    threads), feeds it the channel→agent routes via set_routes(), and calls route_inbound() for every
+    message it receives from the transport.
 
-    Claude attaches over the same socket as a `channel`-role client (via the disposable stdio shim):
-    the Broker pushes unclaimed inbound to it as notify() frames and answers its MCP requests through
-    on_request. There is at most one attached Claude — the newest attach wins."""
+    Each agent's Claude attaches over the socket as a `channel`-role client (via the disposable stdio
+    shim) announcing its agent id: the Broker keeps a registry `agent_id → socket`, pushes a message
+    to the agent bound to its chat_id, and answers each agent's MCP requests through on_request. Per
+    agent the newest attach wins; one channel maps to exactly one agent."""
 
     def __init__(
-        self, transport: Transport, on_request: OnRequest, notify: Notify, clock: Clock = time.time
+        self,
+        transport: Transport,
+        on_request: OnRequest,
+        notify: Notify,
+        on_control: OnControl | None = None,
+        clock: Clock = time.time,
     ) -> None:
         self._transport = transport  # the ONLY caller of the adapter — strict lanes
         self._on_request = on_request
         self._notify = notify
+        self._on_control = on_control
         self._clock = clock
         self._claims: list[_Claim] = []  # open waits, newest-first (a stack)
-        self._emitted: set[tuple[str, str]] = set()
+        self._emitted: set[tuple[str, str, str]] = set()  # (chat_id, kind, dedup_key)
         self._lock = threading.Lock()
-        self._channel: socket.socket | None = (
-            None  # the attached Claude (newest shim wins); None = nobody home
-        )
-        self._chan_lock = threading.Lock()  # guards the _channel reference
+        self._channels: dict[str, socket.socket] = {}  # agent_id → attached Claude (newest wins)
+        self._routes: dict[str, str] = {}  # chat_id → agent_id (enabled agents)
+        self._control_channel: str | None = None
+        self._chan_lock = threading.Lock()  # guards _channels
         self._chan_write_lock = (
             threading.Lock()
-        )  # serializes pushed notifications vs request responses on the one socket
+        )  # serializes pushed notifications vs request responses across the agent sockets
+
+    def set_routes(self, routes: "dict[str, str]", control_channel: str | None) -> None:
+        """Install the channel→agent routing table + the control channel (from the fleet manifest).
+        Replaced atomically on every fleet change — no recycle needed for a routing update."""
+        self._routes = dict(routes)
+        self._control_channel = control_channel
+
+    def is_control(self, chat_id: str) -> bool:
+        return self._control_channel is not None and chat_id == self._control_channel
 
     def _op(self, *args: str) -> tuple[int, str]:
         """Call the adapter, retrying a transient failure — the gateway is the ONE place transport
@@ -176,13 +199,15 @@ class Broker:
         logical message. Returns the new message id on success, or None if the send was deduped
         (dedup_key already emitted) or the transport failed. The single outbound funnel for every
         producer; with dedup_key=None it always sends (today's status/closing behaviour)."""
-        key = (out.kind, out.dedup_key) if out.dedup_key is not None else None
+        key = (out.chat_id, out.kind, out.dedup_key) if out.dedup_key is not None else None
         if key is not None:
             with self._lock:
                 if key in self._emitted:
                     return None
                 self._emitted.add(key)
-        code, mid = self._op("send", out.text, *([out.reply_to] if out.reply_to else []))
+        code, mid = self._op(
+            "send", out.chat_id, out.text, *([out.reply_to] if out.reply_to else [])
+        )
         if code != 0:
             if key is not None:
                 with self._lock:
@@ -192,21 +217,29 @@ class Broker:
             return None
         return mid.strip() or None
 
-    def edit(self, message_id: str, text: str) -> bool:
-        return self._op("edit", message_id, text)[0] == 0
+    def edit(self, chat_id: str, message_id: str, text: str) -> bool:
+        return self._op("edit", chat_id, message_id, text)[0] == 0
 
-    def react(self, message_id: str, emoji: str, add: bool = True) -> bool:
-        return self._op("react" if add else "unreact", message_id, emoji)[0] == 0
+    def react(self, chat_id: str, message_id: str, emoji: str, add: bool = True) -> bool:
+        return self._op("react" if add else "unreact", chat_id, message_id, emoji)[0] == 0
 
-    def latest(self) -> str | None:
-        code, out = self._op("latest")
+    def latest(self, chat_id: str) -> str | None:
+        code, out = self._op("latest", chat_id)
         return out.strip() or None if code == 0 else None
+
+    def create_channel(self, parent_chat_id: str, name: str) -> str | None:
+        """Create a new channel as a sibling of `parent_chat_id` and return its id, or None on failure.
+        Gateway-side only (control `spawn` derives an agent's channel) — the adapter is the gateway's
+        alone (strict lanes), so there is no client-side wrapper for this."""
+        code, out = self._op("create_channel", parent_chat_id, name)
+        return (out.strip() or None) if code == 0 else None
 
     def route_inbound(self, msg: Inbound) -> str:
         """Route ONE inbound message to exactly one sink. Returns "exchange:<label>" if an open claim
-        consumed it, "claude" if pushed to the attached Claude, or "undelivered" if nobody is attached
-        (the Broker reacts ❌ — honest non-delivery, control stays with the user). Total and
-        deterministic — the user's reply is never double-handled."""
+        consumed it, "control" if it was a control-channel command, "claude:<agent>" if pushed to the
+        agent bound to its channel, or "undelivered" if that channel maps to no attached agent (the
+        Broker reacts ❌ in that channel — honest non-delivery). Total and deterministic — the user's
+        reply is never double-handled."""
         with self._lock:
             for claim in list(self._claims):
                 if claim.chat_id == msg.chat_id and _after(msg.id, claim.since_id):
@@ -215,21 +248,27 @@ class Broker:
                         _send_line(claim.conn, {"reply": asdict(msg)})
                     except OSError:
                         claim.conn.close()
-                        continue  # dead waiter — msg NOT consumed; fall through to Claude/❌, never a silent drop
+                        continue  # dead waiter — msg NOT consumed; fall through, never a silent drop
                     claim.conn.close()
                     return f"exchange:{claim.label}"
-        with self._chan_lock:
-            chan = self._channel
-        if chan is not None:
-            try:
-                with self._chan_write_lock:
-                    _send_line(chan, self._notify(msg))
-                return "claude"
-            except OSError:
-                with self._chan_lock:
-                    if self._channel is chan:
-                        self._channel = None  # dead attach — drop it and fall through to ❌
-        self._op("react", msg.id, NO_CLAUDE_REACT)
+        if self.is_control(msg.chat_id):
+            if self._on_control is not None:
+                self._on_control(msg)  # parse + act + reply; never routed to an agent
+            return "control"
+        agent = self._routes.get(msg.chat_id)
+        if agent is not None:
+            with self._chan_lock:
+                chan = self._channels.get(agent)
+            if chan is not None:
+                try:
+                    with self._chan_write_lock:
+                        _send_line(chan, self._notify(msg))
+                    return f"claude:{agent}"
+                except OSError:
+                    with self._chan_lock:
+                        if self._channels.get(agent) is chan:
+                            del self._channels[agent]  # dead attach — drop it, fall through to ❌
+        self._op("react", msg.chat_id, msg.id, NO_CLAUDE_REACT)
         return "undelivered"
 
     def serve(self, sock_path: str = SOCK_PATH) -> None:
@@ -265,16 +304,22 @@ class Broker:
             conn.close()
             return
         if req.get("role") == "channel":
-            # Claude attaching as the channel — the same buffered reader carries its MCP stream, so
-            # no byte is lost between this handshake line and the frames that follow.
-            self._serve_channel(conn, reader)
+            # An agent attaching as the channel — the same buffered reader carries its MCP stream, so
+            # no byte is lost between this handshake line and the frames that follow. The agent id
+            # keys the registry; reject an anonymous attach loudly rather than register a wrong key.
+            agent = req.get("agent")
+            if not isinstance(agent, str) or not agent:
+                conn.close()
+                return
+            self._serve_channel(conn, reader, agent)
             return
         op = req.get("op")
         if op == "ask":
             # Register the claim and LEAVE conn open — route_inbound (or the reaper) writes the
             # reply and closes it. The connection is the claim's liveness signal.
+            chat_id = str(req.get("chat_id", ""))
             claim = _Claim(
-                chat_id=str(req.get("chat_id", "")),
+                chat_id=chat_id,
                 since_id=str(req.get("since_id", "")),
                 conn=conn,
                 expires_at=self._clock() + float(_num(req, "timeout", 600)),
@@ -282,7 +327,7 @@ class Broker:
             )
             prompt = req.get("prompt")
             if isinstance(prompt, str) and prompt:
-                self.emit(Outbound(text=prompt, kind="question", source="gateway"))
+                self.emit(Outbound(text=prompt, kind="question", source="gateway", chat_id=chat_id))
             with self._lock:
                 self._claims.insert(0, claim)
         elif op == "emit":
@@ -291,6 +336,7 @@ class Broker:
                     text=str(req.get("text", "")),
                     kind=as_kind(req.get("kind")),
                     source=str(req.get("source", "gateway")),
+                    chat_id=str(req.get("chat_id", "")),
                     dedup_key=_opt_str(req, "dedup_key"),
                     reply_to=_opt_str(req, "reply_to"),
                 )
@@ -298,11 +344,16 @@ class Broker:
             _send_line(conn, {"id": mid})
             conn.close()
         elif op == "edit":
-            ok = self.edit(str(req.get("message_id", "")), str(req.get("text", "")))
+            ok = self.edit(
+                str(req.get("chat_id", "")),
+                str(req.get("message_id", "")),
+                str(req.get("text", "")),
+            )
             _send_line(conn, {"ok": ok})
             conn.close()
         elif op == "react":
             ok = self.react(
+                str(req.get("chat_id", "")),
                 str(req.get("message_id", "")),
                 str(req.get("emoji", "")),
                 bool(req.get("add", True)),
@@ -310,11 +361,14 @@ class Broker:
             _send_line(conn, {"ok": ok})
             conn.close()
         elif op == "latest":
-            _send_line(conn, {"id": self.latest()})
+            _send_line(conn, {"id": self.latest(str(req.get("chat_id", "")))})
             conn.close()
         elif op == "buttons":
             code, _ = self._op(
-                "buttons", str(req.get("message_id", "")), str(_num(req, "timeout", 570))
+                "buttons",
+                str(req.get("chat_id", "")),
+                str(req.get("message_id", "")),
+                str(_num(req, "timeout", 570)),
             )
             _send_line(conn, {"ok": code == 0})
             conn.close()
@@ -325,14 +379,21 @@ class Broker:
         else:
             conn.close()
 
-    def _serve_channel(self, conn: socket.socket, reader: "IO[str]") -> None:
-        """Serve an attached Claude over `conn`: it becomes the sink for unclaimed inbound (pushed by
-        route_inbound as notify() frames) and the source of MCP requests (answered via on_request).
-        Newest attach wins — a fresh shim supersedes a stale one. The write lock serializes our pushed
-        notifications against these request responses on the one socket; on disconnect we clear the
-        channel only if we are still the current one (a newer attach must not be evicted)."""
+    def _serve_channel(self, conn: socket.socket, reader: "IO[str]", agent: str) -> None:
+        """Serve one attached agent's Claude over `conn`: it becomes the sink for inbound on its
+        channel (pushed by route_inbound as notify() frames) and the source of MCP requests (answered
+        via on_request). Per agent the newest attach wins — a fresh shim supersedes a stale one for
+        the same id (the superseded socket is closed). The write lock serializes our pushed
+        notifications against request responses across the agent sockets; on disconnect we drop this
+        agent's entry only if we are still its current one (a newer attach must not be evicted)."""
         with self._chan_lock:
-            self._channel = conn
+            old = self._channels.get(agent)
+            if old is not None and old is not conn:
+                try:
+                    old.close()
+                except OSError:
+                    pass
+            self._channels[agent] = conn
         try:
             for line in reader:
                 line = line.strip()
@@ -350,8 +411,8 @@ class Broker:
             pass
         finally:
             with self._chan_lock:
-                if self._channel is conn:
-                    self._channel = None
+                if self._channels.get(agent) is conn:
+                    del self._channels[agent]
             conn.close()
 
     def _reap(self) -> None:
@@ -440,30 +501,38 @@ def emit(out: Outbound, *, sock_path: str = SOCK_PATH) -> str | None:
     return mid if isinstance(mid, str) else None
 
 
-def edit(message_id: str, text: str, *, sock_path: str = SOCK_PATH) -> bool:
-    resp = _request({"op": "edit", "message_id": message_id, "text": text}, sock_path)
-    return bool(resp is not None and resp.get("ok"))
-
-
-def react(message_id: str, emoji: str, add: bool = True, *, sock_path: str = SOCK_PATH) -> bool:
+def edit(chat_id: str, message_id: str, text: str, *, sock_path: str = SOCK_PATH) -> bool:
     resp = _request(
-        {"op": "react", "message_id": message_id, "emoji": emoji, "add": add}, sock_path
+        {"op": "edit", "chat_id": chat_id, "message_id": message_id, "text": text}, sock_path
     )
     return bool(resp is not None and resp.get("ok"))
 
 
-def latest(*, sock_path: str = SOCK_PATH) -> str | None:
-    resp = _request({"op": "latest"}, sock_path)
+def react(
+    chat_id: str, message_id: str, emoji: str, add: bool = True, *, sock_path: str = SOCK_PATH
+) -> bool:
+    resp = _request(
+        {"op": "react", "chat_id": chat_id, "message_id": message_id, "emoji": emoji, "add": add},
+        sock_path,
+    )
+    return bool(resp is not None and resp.get("ok"))
+
+
+def latest(chat_id: str, *, sock_path: str = SOCK_PATH) -> str | None:
+    resp = _request({"op": "latest", "chat_id": chat_id}, sock_path)
     v = resp.get("id") if resp is not None else None
     return v if isinstance(v, str) else None
 
 
-def buttons(message_id: str, timeout: float, *, sock_path: str = SOCK_PATH) -> bool:
+def buttons(chat_id: str, message_id: str, timeout: float, *, sock_path: str = SOCK_PATH) -> bool:
     """Ask the gateway to attach approval buttons to an already-sent message, live for `timeout`
     seconds (the caller's reply wait — the single source for the button lifetime). False if the
     gateway is unreachable or the channel can't render them. Additive — the typed-reply path still
     claims a reply if buttons fail, so a False degrades gracefully rather than blocking approval."""
-    resp = _request({"op": "buttons", "message_id": message_id, "timeout": timeout}, sock_path)
+    resp = _request(
+        {"op": "buttons", "chat_id": chat_id, "message_id": message_id, "timeout": timeout},
+        sock_path,
+    )
     return bool(resp is not None and resp.get("ok"))
 
 

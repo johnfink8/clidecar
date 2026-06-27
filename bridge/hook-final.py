@@ -4,7 +4,7 @@
 The deterministic fix for the dropped-reply problem: it fires every turn, regardless of
 whether the model called the `reply` tool. Every failure edge is loud — if extraction
 breaks, the answer is empty, the closing never flushed, or Discord refuses the post,
-John gets a ⚠️ ping and/or the answer is persisted to disk; the status message is only
+the owner gets a ⚠️ ping and/or the answer is persisted to disk; the status message is only
 marked ✅ when the answer actually landed.
 
 The Stop hook can fire before the closing message is flushed to the transcript, so we
@@ -111,6 +111,9 @@ def main() -> None:
     sid = event.session_id
     transcript = event.transcript_path
     state = h.load_turn(sid) or h.TurnState()
+    # Closing answer lands in this agent's channel: the turn's chat_id, else its own channel (an
+    # autonomous turn carries no inbound chat_id). Set BEFORE any channel_send (fail() sends).
+    h.set_target(state.chat_id or h.channel_home())
 
     if not transcript or not os.path.exists(transcript):
         return fail(sid, "Stop hook got no transcript — answer may be lost; check console.")
@@ -163,9 +166,7 @@ def main() -> None:
 
         decorate_source(state)
         if not already_sent:
-            h.channel_send(
-                h.DONE_PING
-            )  # John's pick: one tiny ✅ message — the sole done marker + push
+            h.channel_send(h.DONE_PING)  # one tiny ✅ message — the sole done marker + push
 
         if tid is not None:
             state.done = tid

@@ -116,6 +116,7 @@ def main() -> None:
     # An autonomously-entered plan-mode turn carries no inbound chat_id; fall back to the channel's
     # home chat so the gate can still reach the user (and isn't trapped in plan mode).
     chat_id = (turn.chat_id if turn else None) or h.channel_home()
+    h.set_target(chat_id)
     use_buttons = h.can("buttons")
     # Newest message id BEFORE posting, so the Exchange only claims a genuinely new reply.
     since_id = h.channel_latest()

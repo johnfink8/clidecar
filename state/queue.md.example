@@ -1,16 +1,16 @@
 # Task queue
 
-> The running backlog the managed Claude works from. Edit this to redirect it;
-> a fresh instance reads it on launch. Keep entries small and actionable. Done
-> items move to the bottom or get deleted.
+> The managed Claude's CURRENT, ACTIONABLE backlog — read on every launch, edited
+> by the user to redirect it. ONLY open work for THIS project belongs here.
+> - Done items get DELETED, not archived. History lives in git + the memory store.
+> - No durable/persistent facts and no other projects — those go to the memory
+>   store (anything left here is reloaded into context every single launch).
+> Keep entries small and actionable.
 
 ## Now
 - [ ] _(first task)_
 
 ## Next
-- [ ]
-
-## Someday
 - [ ]
 
 ## Done

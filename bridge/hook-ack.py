@@ -2,7 +2,7 @@
 """UserPromptSubmit hook — acknowledge a Discord-delivered prompt with a 👀 reaction.
 
 A channel-delivered prompt carries its source `<channel chat_id=… message_id=…>`
-wrapper, so we react to John's own message rather than posting a placeholder. Launch
+wrapper, so we react to the owner's own message rather than posting a placeholder. Launch
 or TUI prompts have no source message, so there is nothing to react to.
 """
 
@@ -28,13 +28,13 @@ def main() -> None:
     event = h.read_event("UserPromptSubmit")
     sid = event.session_id
     mid = source_message_id(event.prompt)
+    chat_id = envelope_attr(event.prompt, "chat_id")
+    h.set_target(chat_id)
     # Reset per-turn state every turn (clearing the prior turn's done tombstone), whether
     # or not this prompt carries a source message to react to. chat_id is stashed so a mid-turn
     # AskUserQuestion can open an Exchange back on the same channel (see hook-question).
     with h.turn_lock(sid):
-        h.save_turn(
-            sid, h.TurnState(source_message_id=mid, chat_id=envelope_attr(event.prompt, "chat_id"))
-        )
+        h.save_turn(sid, h.TurnState(source_message_id=mid, chat_id=chat_id))
     if not mid:
         h.log_event("UserPromptSubmit", {"outcome": "no_source_message"})
         return

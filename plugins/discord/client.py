@@ -40,14 +40,17 @@ VIEW_GRACE_S = (
     15.0  # the View outlives the hook's reply wait by this, so no claim-open-but-View-shut gap
 )
 
-# A bound (interaction, content) -> bool: synthesize an inbound from the interaction and deliver it,
-# returning True only if it passed the allowlist gate (False = a non-allowlisted click, dropped).
-Deliver = Callable[[discord.Interaction, str], bool]
+# A bound (interaction, content, channel_id) -> bool: synthesize an inbound from the interaction in
+# that channel and deliver it, returning True only if it passed the allowlist gate (False = a
+# non-allowlisted click, dropped).
+Deliver = Callable[[discord.Interaction, str, str], bool]
 
 
 def _read_creds() -> "tuple[str, str]":
-    """(token, channel_id) from the Discord channel's .env. Empty strings if unset/unreadable; the
-    caller fails loud on that."""
+    """(token, legacy_channel_id) from the Discord channel's .env. The token is the real credential;
+    legacy_channel_id is only a `home` fallback for a single-agent setup — multi-agent routing comes
+    from the fleet via set_channels(). Empty strings if unset/unreadable; start() fails loud on a
+    missing token."""
     token = os.environ.get("DISCORD_BOT_TOKEN", "")
     channel_id = os.environ.get("DISCORD_CHANNEL_ID", "")
     try:
@@ -103,7 +106,7 @@ class _Listener(discord.Client):
 
     def __init__(
         self,
-        channel_id: str,
+        is_allowed: "Callable[[str], bool]",
         allow: "set[str]",
         on_inbound: "Callable[[str], None]",
         ready: threading.Event,
@@ -115,7 +118,7 @@ class _Listener(discord.Client):
         intents.dm_messages = True
         intents.message_content = True  # privileged; without it the gateway sends empty content
         super().__init__(intents=intents)
-        self._channel_id = channel_id
+        self._is_allowed = is_allowed  # channel-id membership, read live (the fleet's listen-set)
         self._allow = allow
         self._on_inbound = on_inbound
         self._ready_evt = (
@@ -143,8 +146,8 @@ class _Listener(discord.Client):
         self._ready_evt.set()
 
     async def on_message(self, message: discord.Message) -> None:
-        if str(message.channel.id) != self._channel_id:
-            return
+        if not self._is_allowed(str(message.channel.id)):
+            return  # not a fleet channel (agent channel or control) — ignore
         line = gate.shape(_raw(message), self._allow)
         if line:
             self._on_inbound(line)  # non-blocking by contract — must not block the event loop
@@ -187,15 +190,20 @@ async def _deny_click(interaction: discord.Interaction) -> None:
 
 
 class _ReviseModal(discord.ui.Modal):
-    """The Request-changes popup: John's typed feedback becomes the revise-context — a non-affirmative
+    """The Request-changes popup: the owner's typed feedback becomes the revise-context — a non-affirmative
     reply, so the plan hook DENIES and stays in plan mode."""
 
     def __init__(
-        self, deliver: "Deliver", plan_message: "discord.Message | None", timeout: float
+        self,
+        deliver: "Deliver",
+        plan_message: "discord.Message | None",
+        timeout: float,
+        channel_id: str,
     ) -> None:
         super().__init__(title="Request changes", timeout=timeout)
         self._deliver = deliver
         self._plan_message = plan_message
+        self._channel_id = channel_id
         self._feedback: discord.ui.TextInput[discord.ui.View] = discord.ui.TextInput(
             label="What should change?", style=discord.TextStyle.paragraph, max_length=1500
         )
@@ -203,7 +211,9 @@ class _ReviseModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         delivered = self._deliver(
-            interaction, str(self._feedback.value).strip() or "(no feedback given)"
+            interaction,
+            str(self._feedback.value).strip() or "(no feedback given)",
+            self._channel_id,
         )
         if not delivered:
             await _deny_click(interaction)
@@ -220,15 +230,16 @@ class _ApprovalView(discord.ui.View):
     the revise-context. The timeout outlives the hook's wait so a click always lands while the claim
     is open."""
 
-    def __init__(self, deliver: "Deliver", timeout: float) -> None:
+    def __init__(self, deliver: "Deliver", timeout: float, channel_id: str) -> None:
         super().__init__(timeout=timeout)
         self._deliver = deliver
+        self._channel_id = channel_id
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(
         self, interaction: discord.Interaction, _button: "discord.ui.Button[discord.ui.View]"
     ) -> None:
-        if not self._deliver(interaction, "approve"):
+        if not self._deliver(interaction, "approve", self._channel_id):
             await _deny_click(interaction)
             return
         body = interaction.message.content if interaction.message else ""
@@ -239,7 +250,12 @@ class _ApprovalView(discord.ui.View):
         self, interaction: discord.Interaction, _button: "discord.ui.Button[discord.ui.View]"
     ) -> None:
         await interaction.response.send_modal(
-            _ReviseModal(self._deliver, interaction.message, self.timeout or APPROVAL_TIMEOUT)
+            _ReviseModal(
+                self._deliver,
+                interaction.message,
+                self.timeout or APPROVAL_TIMEOUT,
+                self._channel_id,
+            )
         )
 
 
@@ -249,34 +265,38 @@ class DiscordClient:
     """
 
     def __init__(self, on_inbound: "Callable[[str], None]") -> None:
-        self._token, self._channel_id = _read_creds()
+        self._token, self._home_channel_id = _read_creds()
         self._on_inbound = on_inbound
         self._allow = gate.allowed_senders()
+        # The fleet's listen-set, installed by set_channels before start() and live on every change.
+        # frozenset so on_message (loop thread) reads it lock-free while a refresh atomically swaps it.
+        self._channels_allowed: frozenset[str] = frozenset()
         self._ready = threading.Event()
         self.fatal = threading.Event()
         self.fatal_reason = ""
         self._stopping = False
         self._link = _Link()
-        self._ch: discord.abc.Messageable | None = None
+        self._ch_cache: dict[str, discord.abc.Messageable] = {}
         self.loop = asyncio.new_event_loop()
-        self._client = _Listener(self._channel_id, self._allow, on_inbound, self._ready, self._link)
+        self._client = _Listener(
+            self._is_channel_allowed, self._allow, on_inbound, self._ready, self._link
+        )
         self._thread = threading.Thread(target=self._loop_main, name="discord-loop", daemon=True)
 
-    def _deliver(self, interaction: discord.Interaction, content: str) -> bool:
-        return _deliver_interaction(
-            self._on_inbound, self._allow, self._channel_id, interaction, content
-        )
+    def set_channels(self, channel_ids: "set[str]") -> None:
+        self._channels_allowed = frozenset(channel_ids)
+
+    def _is_channel_allowed(self, channel_id: str) -> bool:
+        return channel_id in self._channels_allowed
+
+    def _deliver(self, interaction: discord.Interaction, content: str, channel_id: str) -> bool:
+        return _deliver_interaction(self._on_inbound, self._allow, channel_id, interaction, content)
 
     # --- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
-        if not self._token or not self._channel_id:
-            self._fail("DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID not set")
-            return
-        try:
-            int(self._channel_id)
-        except ValueError:
-            self._fail(f"DISCORD_CHANNEL_ID is not numeric: {self._channel_id!r}")
+        if not self._token:
+            self._fail("DISCORD_BOT_TOKEN not set")
             return
         self._thread.start()
 
@@ -329,73 +349,102 @@ class DiscordClient:
 
     # --- outbound ----------------------------------------------------------
 
-    async def _channel(self) -> discord.abc.Messageable:
-        if self._ch is not None:
-            return self._ch
-        cid = int(self._channel_id)
+    async def _channel(self, chat_id: str) -> discord.abc.Messageable:
+        cached = self._ch_cache.get(chat_id)
+        if cached is not None:
+            return cached
+        cid = int(chat_id)
         ch = self._client.get_channel(cid) or await self._client.fetch_channel(cid)
         if not isinstance(ch, discord.abc.Messageable):
-            # A wrong DISCORD_CHANNEL_ID is a permanent misconfig, not a transient blip — go fatal so
-            # the daemon alerts + relaunches loudly, rather than silently 1-out every outbound forever.
-            self._fail(
-                f"DISCORD_CHANNEL_ID {cid} is not a messageable channel ({type(ch).__name__})"
-            )
-            raise RuntimeError(self.fatal_reason)
-        self._ch = ch
+            # A non-messageable channel id is a misconfigured fleet route, not a transient blip — but
+            # with many channels it's per-route, so raise (caller 1-outs + logs) rather than fatal the
+            # whole client and take down every other agent's channel.
+            raise RuntimeError(f"channel {cid} is not messageable ({type(ch).__name__})")
+        self._ch_cache[chat_id] = ch
         return ch
+
+    async def _create_channel(self, parent_id: str, rest: "tuple[str, ...]") -> "tuple[int, str]":
+        """Create a text channel as a sibling of `parent_id` (same guild + same category) and return
+        its new id on stdout. The gateway uses this to give a freshly spawned agent its own channel so
+        the owner never hand-creates one. Needs the bot's Manage Channels permission in that category;
+        a Forbidden/HTTPException is caught by the caller and reported as a failed dispatch (1, "")."""
+        name = rest[0] if rest else ""
+        if not name:
+            sys.stderr.write("discord create_channel: missing name\n")
+            return 1, ""
+        parent = self._client.get_channel(int(parent_id)) or await self._client.fetch_channel(
+            int(parent_id)
+        )
+        if not isinstance(parent, discord.TextChannel):
+            # The locator (the control channel) must be a normal text channel so it has a guild +
+            # category to create a sibling under — a misconfig, so fail loud rather than guess.
+            sys.stderr.write(
+                f"discord create_channel: parent {parent_id} is not a text channel "
+                f"({type(parent).__name__})\n"
+            )
+            return 1, ""
+        new = await parent.guild.create_text_channel(name, category=parent.category)
+        return 0, str(new.id)
 
     def dispatch(self, verb: str, *args: str) -> "Coroutine[object, object, tuple[int, str]]":
         return self._dispatch(verb, *args)
 
     async def _dispatch(self, verb: str, *args: str) -> "tuple[int, str]":
-        """Map an adapter verb to discord.py. Returns (0, stdout) on success — stdout carries the
-        new message id for `send`/`latest` and the rendered lines for `fetch` — else (1, "")."""
+        """Map an adapter verb to discord.py. Every channel verb takes the target chat_id as its FIRST
+        arg (multi-agent routing); `home` takes none. Returns (0, stdout) on success — stdout carries
+        the new message id for `send`/`latest` and the rendered lines for `fetch` — else (1, "")."""
         if verb == "home":
-            return 0, self._channel_id  # pure config — answerable even while the link is down
+            return 0, self._home_channel_id  # pure config — answerable even while the link is down
+        if not args:
+            sys.stderr.write(f"discord dispatch {verb!r}: missing chat_id\n")
+            return 1, ""
+        chat_id, rest = args[0], args[1:]
         try:
             await asyncio.wait_for(self._client.wait_until_ready(), timeout=READY_WAIT_S)
-            ch = await self._channel()
+            if verb == "create_channel":
+                return await self._create_channel(chat_id, rest)
+            ch = await self._channel(chat_id)
             if verb == "send":
-                text = args[0] if args else ""
-                reply_to = args[1] if len(args) > 1 else ""
+                text = rest[0] if rest else ""
+                reply_to = rest[1] if len(rest) > 1 else ""
                 if reply_to:
                     ref = discord.MessageReference(
-                        message_id=int(reply_to), channel_id=int(self._channel_id)
+                        message_id=int(reply_to), channel_id=int(chat_id)
                     )
                     msg = await ch.send(text, reference=ref)
                 else:
                     msg = await ch.send(text)
                 return 0, str(msg.id)
             if verb == "edit":
-                msg = await ch.fetch_message(int(args[0]))
-                await msg.edit(content=args[1])
+                msg = await ch.fetch_message(int(rest[0]))
+                await msg.edit(content=rest[1])
                 return 0, ""
             if verb in ("react", "unreact"):
-                msg = await ch.fetch_message(int(args[0]))
+                msg = await ch.fetch_message(int(rest[0]))
                 if verb == "react":
-                    await msg.add_reaction(args[1])
+                    await msg.add_reaction(rest[1])
                     return 0, ""
                 me = self._client.user
                 if me is None:
                     return 1, ""  # ready but no bot user — invariant violation, don't fake success
-                await msg.remove_reaction(args[1], me)
+                await msg.remove_reaction(rest[1], me)
                 return 0, ""
             if verb == "latest":
                 async for msg in ch.history(limit=1):
                     return 0, str(msg.id)
                 return 0, ""
             if verb == "fetch":
-                n = int(args[0]) if args else 25
+                n = int(rest[0]) if rest else 25
                 rendered = [history.render(_raw(m)) async for m in ch.history(limit=n)]
                 lines = [ln for ln in reversed(rendered) if ln]  # history() is newest-first
                 return 0, ("\n".join(lines) + "\n" if lines else "")
             if verb == "buttons":
-                # The View lifetime derives from the hook's reply wait (args[1]) plus a grace, so
+                # The View lifetime derives from the hook's reply wait (rest[1]) plus a grace, so
                 # there's one source of truth for it — not a magic constant re-declared here.
-                mid = args[0] if args else ""
-                view_timeout = float(args[1]) + VIEW_GRACE_S if len(args) > 1 else APPROVAL_TIMEOUT
+                mid = rest[0] if rest else ""
+                view_timeout = float(rest[1]) + VIEW_GRACE_S if len(rest) > 1 else APPROVAL_TIMEOUT
                 msg = await ch.fetch_message(int(mid))
-                await msg.edit(view=_ApprovalView(self._deliver, view_timeout))
+                await msg.edit(view=_ApprovalView(self._deliver, view_timeout, chat_id))
                 return 0, ""
             return 1, ""
         except (discord.HTTPException, discord.NotFound, ValueError, RuntimeError, OSError) as e:

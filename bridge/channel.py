@@ -33,6 +33,10 @@ class ChannelClient(Protocol):
     def start(self) -> None: ...
     def shutdown(self, timeout: float = ...) -> None: ...
     def dispatch(self, verb: str, *args: str) -> "Coroutine[object, object, tuple[int, str]]": ...
+    def set_channels(self, channel_ids: "set[str]") -> None:
+        """Install the set of channels to accept inbound from (the fleet's enabled-agent channels +
+        the control channel). Called before start() and again live on every fleet change."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,12 @@ def _read_config(key: str) -> str | None:
     except OSError:
         pass
     return None
+
+
+def read_config(key: str) -> str | None:
+    """A single config.env value (CHANNEL, CONTROL_OWNER, …), or None. Public so gateway-side code
+    (the control parser) reads the same config the channel resolver does."""
+    return _read_config(key)
 
 
 def _plugins_dir() -> str:
